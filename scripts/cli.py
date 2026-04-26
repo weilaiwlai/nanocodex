@@ -99,7 +99,10 @@ def stream_reply(
 ) -> None:
     session_runtime.update_name_from_user_input(user_input)
     print("Agent>")
-    asyncio.run(_stream_reply_events(user_input, config, session_runtime))
+    try:
+        asyncio.run(_stream_reply_events(user_input, config, session_runtime))
+    except APIConnectionError:
+        print_connection_error()
     print()
 
 

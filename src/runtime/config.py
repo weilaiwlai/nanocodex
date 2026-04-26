@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -34,7 +35,8 @@ def load_runtime_config() -> RuntimeConfig:
     base_url = (os.getenv("OPENAI_BASE_URL") or "").strip() or None
 
     if not api_key:
-        raise SystemExit("Configuration error: Missing required env var: OPENAI_API_KEY")
+        print("Configuration error: Missing required env var: OPENAI_API_KEY", file=sys.stderr)
+        raise SystemExit(1)
 
     return RuntimeConfig(
         api_key=api_key,

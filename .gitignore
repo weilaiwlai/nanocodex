@@ -1,15 +1,88 @@
+# Python
 .venv/
-.pytest_cache/
+env/
+env.local/
+env.development.local/
+env.test.local/
+env.production.local/
+
+# Python cache
 __pycache__/
-*.pyc
-/docs/
-/tests/
-.env
-openai_compatible_check.py
-artifacts/tool-output/
-artifacts/compaction/
-artifacts/traces/
-artifacts/prompt_history.txt
-artifacts/todos/
-artifacts/sessions/
+*.py[cod]
+*$py.class
+
+# pytest
+.pytest_cache/
+coverage.xml
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Node.js
 tui/node_modules/
+tui/.npm/
+tui/dist/
+tui/build/
+tui/.next/
+tui/out/
+tui/.nuxt/
+tui/.vuepress/dist/
+tui/.gatsby-cache/
+
+.trae/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Artifacts
+artifacts/
+
+# IDE and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Testing
+/coverage/
+.nyc_output/
+
+# Documentation
+/docs/
+/site/
+
+# Local development
+.local/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

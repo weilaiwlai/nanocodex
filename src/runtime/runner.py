@@ -25,14 +25,23 @@ from src.tools.registry import AGENT_TOOLS
 
 def configure_openai_runtime(config: RuntimeConfig) -> None:
     """设置所有 CLI 运行共享的最小 SDK 默认项。"""
-    client = AsyncOpenAI(
-        base_url=config.base_url,
-        api_key=config.api_key,
-    )
-    set_default_openai_client(client, use_for_tracing=False)
-    # 先与已验证稳定的兼容性探针保持一致，后续再逐步接入 tracing 和 session。
-    set_default_openai_api("chat_completions")
-    set_tracing_disabled(True)
+    try:
+        client = AsyncOpenAI(
+            base_url=config.base_url,
+            api_key=config.api_key,
+            timeout=30.0,
+        )
+        set_default_openai_client(client, use_for_tracing=False)
+        # 先与已验证稳定的兼容性探针保持一致，后续再逐步接入 tracing 和 session。
+        set_default_openai_api("chat_completions")
+        set_tracing_disabled(True)
+    except Exception as e:
+        error_msg = f"Failed to configure OpenAI client: {str(e)}"
+        if "SSL" in str(e):
+            error_msg += "\nSSL error detected. Please check your SSL certificates or network configuration."
+        if config.base_url:
+            error_msg += f"\nUsing base URL: {config.base_url}"
+        raise RuntimeError(error_msg) from e
 
 
 def build_session_input_callback(context_bundle):
