@@ -157,6 +157,123 @@ src/
 
 - **protocol**：定义统一的工具响应协议，确保所有工具的输出格式一致，便于 Agent 理解和处理。
 
+## 目录结构详解
+
+```
+xcode/
+├── scripts/                      # CLI 入口脚本
+│   ├── __init__.py
+│   └── cli.py                    # 主 CLI 入口，支持交互式 prompt、session 管理、参数解析
+│
+├── src/                          # 核心源代码
+│   ├── runtime/                  # 运行时核心模块
+│   │   ├── __init__.py
+│   │   ├── runner.py             # 事件流执行器，运行 Agent 并 yield 结构化事件
+│   │   ├── session.py            # 会话管理，Session 持久化、workspace 绑定
+│   │   ├── agent_factory.py      # Agent 工厂，构建根 Agent 和 system prompt
+│   │   ├── config.py             # 运行时配置加载（环境变量）
+│   │   ├── events.py             # 事件构建器，统一的事件格式封装
+│   │   ├── tracing.py            # 本地 tracing，写 JSONL/HTML trace 文件
+│   │   └── paths.py              # 路径工具函数
+│   │
+│   ├── tools/                    # 工具集
+│   │   ├── __init__.py
+│   │   ├── registry.py           # 工具注册表，汇总所有 Agent 工具
+│   │   ├── read_only.py          # 只读工具：LS、Glob、Grep、Read
+│   │   ├── edit_write.py         # 编辑工具：Edit、Write
+│   │   ├── todo_write.py         # Todo 工具：TodoWrite
+│   │   ├── bash_tool.py          # Bash 最小封装
+│   │   ├── task_tools.py         # 任务管理工具：TaskCreate/Update/List/Get
+│   │   ├── team_tools.py         # 团队协作工具
+│   │   ├── skill_tool.py          # Skill 加载工具
+│   │   ├── worktree_tools.py      # Git worktree 管理
+│   │   ├── compaction_tool.py     # 上下文压缩工具
+│   │   ├── common.py              # 工具通用函数（截断、错误处理等）
+│   │   └── skill_loader.py        # Skill 加载器
+│   │
+│   ├── context/                  # 上下文工程
+│   │   ├── __init__.py
+│   │   ├── context_builder.py    # 上下文构建器，L1/L2/L3 分层构建
+│   │   ├── compaction.py          # 上下文压缩：micro_compact、auto_compact、Compact
+│   │   └── file_mentions.py       # @file 预处理
+│   │
+│   ├── tasks/                    # 任务系统
+│   │   ├── __init__.py
+│   │   ├── task_graph.py          # 任务图：任务依赖、claim、lease、heartbeat
+│   │   ├── task_store.py          # 任务持久化存储
+│   │   ├── agent_team.py          # 多 Agent 协作：team-lead、长寿命 teammate
+│   │   ├── subagent.py            # 一次性分析子代理
+│   │   ├── background.py          # 后台命令执行
+│   │   └── worktrees.py           # Git worktree 管理
+│   │
+│   ├── protocol/                 # 工具协议
+│   │   ├── __init__.py
+│   │   └── tool_response.py        # 统一工具响应协议
+│   │
+│   └── __init__.py
+│
+├── tui/                          # 终端 UI（React + Ink）
+│   ├── package.json              # TUI 项目配置
+│   ├── tsconfig.json             # TypeScript 配置
+│   └── src/
+│       ├── index.tsx             # TUI 主组件，渲染 CLI JSONL 事件为 UI
+│       ├── input_model.ts        # 输入状态机，处理多行输入、快捷键
+│       ├── input_model.test.ts    # 输入模型测试
+│       └── timeline.test.ts       # Timeline 测试
+│
+├── skills/                       # Skill 扩展
+│   ├── code-review/
+│   │   └── SKILL.md              # Code Review skill 定义
+│   └── repo-explore/
+│       └── SKILL.md              # Repo Explore skill 定义
+│
+├── artifacts/                   # 运行时产物目录（自动生成）
+│   ├── sessions/                # Session 持久化存储
+│   ├── traces/                  # Trace 文件（jsonl + html）
+│   ├── tool-output/             # 工具输出落盘
+│   ├── compaction/              # 上下文压缩归档
+│   └── todos/                   # Todo 状态持久化
+│
+├── tests/                       # 单元测试
+├── .env.example                 # 环境变量模板
+├── .gitignore                   # Git 忽略配置
+├── pyproject.toml               # Python 项目配置
+├── uv.lock                      # uv 依赖锁定文件
+├── README.md                    # 项目文档
+└── code_law.md                  # 代码规范
+```
+
+### 上下文分层 (L1/L2/L3)
+
+| 层级 | 名称 | 说明 |
+|------|------|------|
+| L1 | 稳定 System Prompt | Identity、Principles、Capability Routing 等固定提示词 |
+| L2 | 长期记忆 | workspace-scoped memory，跨 session 持久化 |
+| L3 | Session Summary | 会话摘要，压缩后的关键信息存档 |
+
+### 压缩模式
+
+| 模式 | 说明 | 触发条件 |
+|------|------|----------|
+| micro_compact | 微压缩，清理长工具输出 | 连续 6+ 个工具结果，单条超过 600 字符 |
+| auto_compact | 自动压缩，基于 token 阈值 | 上下文 token 达到 12000 |
+| Compact | 手动压缩，生成完整摘要 | 用户显式触发 |
+
+### Session 与 Workspace 关系
+
+```
+~/.xx-coding/
+└── projects/
+    └── <project-key>/           # 项目唯一标识（基于路径生成）
+        └── memory/
+            ├── MEMORY.md        # 记忆索引
+            └── topics/          # 主题记忆文件
+                ├── user/
+                ├── feedback/
+                ├── project/
+                └── reference/
+```
+
 ## 产物与日志
 
 ### 运行时产物
