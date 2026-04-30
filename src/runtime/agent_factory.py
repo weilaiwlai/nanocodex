@@ -32,7 +32,7 @@ def _build_default_instructions() -> str:
 def build_root_agent(*, model: str, instructions: str | None = None) -> Agent:
     """创建 CLI 当前使用的唯一顶层 Agent。"""
     return Agent(
-        name="xx-coding",
+        name="nanocodex",
         instructions=instructions or _build_default_instructions(),
         model=model,
         tools=AGENT_TOOLS,

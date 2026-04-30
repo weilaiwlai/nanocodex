@@ -7,7 +7,7 @@ from pathlib import Path
 
 # 这是 agent 自己代码仓库的稳定根目录，只用于源码和内置资源。
 AGENT_CODE_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_APP_HOME_DIRNAME = ".xx-coding"
+DEFAULT_APP_HOME_DIRNAME = ".nanocodex"
 DEFAULT_MEMORY_INDEX_FILENAME = "MEMORY.md"
 _PROJECT_KEY_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 

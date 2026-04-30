@@ -354,7 +354,7 @@ function App(): React.ReactElement {
 	return (
 		<Box flexDirection="column" paddingX={1}>
 			<Box marginBottom={1} flexDirection="column">
-				<Text color="cyan">xx-coding TUI (Ink MVP)</Text>
+				<Text color="cyan">nanocodex TUI (Ink MVP)</Text>
 				<Text>
 					Session: {session?.session_name ?? '加载中...'} {session ? `(${session.session_id})` : ''}
 				</Text>

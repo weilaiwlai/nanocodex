@@ -1,1 +1,1 @@
-"""Application package for the xx-coding CLI agent."""
+"""Application package for the nanocodex CLI agent."""
