@@ -8,6 +8,7 @@ from uuid import uuid4
 
 @dataclass(slots=True)
 class RuntimeEventBuilder:
+    """运行时事件构建器，负责构建结构化的 runtime 事件。"""
     # 这层只负责把一轮 run 中发生的事情包装成统一事件信封。
     run_id: str
     session_id: str

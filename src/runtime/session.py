@@ -31,7 +31,7 @@ def _utc_now() -> str:
 
 
 def _build_default_session_name() -> str:
-    # 默认名只承担“先能识别这个会话”的职责，不让 session 一开始就是空标题。
+    # 默认名只承担"先能识别这个会话"的职责，不让 session 一开始就是空标题。
     return f"未命名会话 {datetime.now().strftime('%Y-%m-%d %H:%M')}"
 
 
@@ -85,9 +85,11 @@ class ReadSnapshot:
 
 @dataclass(slots=True)
 class TodoStateItem:
-    # Todo 当前阶段只保留任务内容和状态，不引入 id 或 patch 元信息。
+    # Todo 带有 id 用于跨更新追踪，created_at 用于时间排序。
+    id: str
     content: str
     status: str
+    created_at: str = ""
 
 
 @dataclass(slots=True)
@@ -100,7 +102,7 @@ class TodoState:
 
 @dataclass(slots=True)
 class ToolRuntimeContext:
-    # 这张表按“规范化路径 -> 最近一次成功 Read 的快照”保存。
+    # 这张表按"规范化路径 -> 最近一次成功 Read 的快照"保存。
     # 同一路径再次读取时只覆盖自己，不会把别的文件快照挤掉。
     session_id: str = "detached-session"
     session_name: str = "detached-session"
@@ -111,10 +113,10 @@ class ToolRuntimeContext:
     traces_dir: Path = field(default_factory=lambda: _default_session_root() / "detached-session" / "traces")
     compaction_dir: Path = field(default_factory=lambda: _default_session_root() / "detached-session" / "compaction")
     # workspace_root 表示这次会话服务哪个仓库根目录。
-    # execution_root 表示当前工具默认在哪个目录执行；phase 4 会把它切到 worktree。
+    # execution_root 表示当前工具默认在哪个目录执行；worktree 任务会把它切到对应目录。
     workspace_root: Path = field(default_factory=_default_workspace_root)
     execution_root: Path = field(default_factory=_default_workspace_root)
-    # team_dir 和 actor_name 是 AgentTeam phase 1 新加的最小协作状态。
+    # team_dir 和 actor_name 是 AgentTeam 的协作状态。
     # lead 和 teammate 共享一套 session 目录，但通过 actor_name 区分发送者身份。
     team_dir: Path = field(default_factory=lambda: _default_session_root() / "detached-session" / "team")
     current_model: str | None = None
@@ -172,12 +174,17 @@ class ToolRuntimeContext:
         return snapshot
 
     def set_todo_state(self, summary: str, todos: list[dict[str, str]], recap: str) -> None:
-        # 这里保存的是“当前 todo 视图”，后续可直接用于 prompt 注入或 UI 展示。
+        # 这里保存的是"当前 todo 视图"，可直接用于 prompt 注入或 UI 展示。
         self.todo_state = TodoState(
             summary=summary,
             todos=[
-                TodoStateItem(content=item["content"], status=item["status"])
-                for item in todos
+                TodoStateItem(
+                    id=item.get("id", f"todo-{i}"),
+                    content=item["content"],
+                    status=item["status"],
+                    created_at=item.get("created_at", ""),
+                )
+                for i, item in enumerate(todos)
             ],
             recap=recap,
         )
@@ -228,7 +235,7 @@ class ToolRuntimeContext:
         return self.active_trace_run_id
 
     def log_trace_context_build(self, payload: dict[str, object]) -> None:
-        # context_build 只记录“这一轮送给模型前的关键治理信息”，不把整段上下文全文重写进 trace。
+        # context_build 只记录"这一轮送给模型前的关键治理信息"，不把整段上下文全文重写进 trace。
         if self.trace_logger is None or self.active_trace_run_id is None:
             return
         self.trace_logger.log_context_build(
@@ -380,6 +387,7 @@ def _read_current_session_pointer(pointer_path: Path) -> str | None:
 
 
 def list_saved_sessions(*, session_root: Path | None = None) -> list[SessionMeta]:
+    """列出所有已保存的会话，按最近活跃时间排序"""
     active_root = session_root or _default_session_root()
     if not active_root.exists():
         return []
@@ -405,7 +413,8 @@ def build_cli_session_runtime(
     workspace_root: Path | None = None,
     trace_enabled: bool | None = None,
 ) -> CliSessionRuntime:
-    # 第一版先把“启动时恢复/选择 session”做好，不做运行中的 session 切换。
+    """创建 CLI 会话运行时环境"""
+    # 第一版先把"启动时恢复/选择 session"做好，不做运行中的 session 切换。
     active_root = session_root or _default_session_root()
     active_root.mkdir(parents=True, exist_ok=True)
     pointer_path = _session_pointer_path(active_root)
@@ -429,7 +438,7 @@ def build_cli_session_runtime(
     tasks_dir = session_dir / "tasks"
     traces_dir = session_dir / "traces"
     compaction_dir = session_dir / "compaction"
-    # AgentTeam phase 1 先把 team 状态和 transcript 都收进同一 session 根目录下。
+    # AgentTeam 把 team 状态、transcript 和独立 session 都收进同一 session 根目录下。
     team_dir = session_dir / "team"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     traces_dir.mkdir(parents=True, exist_ok=True)
@@ -450,7 +459,7 @@ def build_cli_session_runtime(
     session = SQLiteSession(
         session_id=active_session_id,
         db_path=session_dir / "session.db",
-    )
+    )  #创建 SQLiteSession 实例，用于存储会话状态
     context = ToolRuntimeContext(
         session_id=active_session_id,
         session_name=meta.name,
@@ -468,13 +477,13 @@ def build_cli_session_runtime(
             trace_dir=traces_dir,
             enabled=trace_enabled,
         ),
-    )
+    )  #创建 ToolRuntimeContext 实例，用于存储会话上下文信息
 
     # 旧进程退出后，残留的 running 任务要被诚实地标成失败，而不是继续伪装活着。
     from src.tasks.background import mark_interrupted_running_tasks
     from src.tasks.agent_team import build_agent_team_runtime
 
-    mark_interrupted_running_tasks(tasks_dir=tasks_dir)
+    mark_interrupted_running_tasks(tasks_dir=tasks_dir)  #恢复异常退出的后台任务
     # team runtime 是 session 级对象：CLI 每次恢复 session 时一并恢复 team 状态视图。
     context.team_runtime = build_agent_team_runtime(runtime_context=context)
     return CliSessionRuntime(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -31,6 +31,9 @@ class HistorySummary:
     key_constraints_and_decisions: list[str]
     important_files_and_evidence: list[str]
     unfinished_items: list[str]
+    active_topics: list[str] = field(default_factory=list)
+    errors_encountered: list[str] = field(default_factory=list)
+    decisions_rationale: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -39,6 +42,9 @@ class HistorySummary:
             "key_constraints_and_decisions": list(self.key_constraints_and_decisions),
             "important_files_and_evidence": list(self.important_files_and_evidence),
             "unfinished_items": list(self.unfinished_items),
+            "active_topics": list(self.active_topics),
+            "errors_encountered": list(self.errors_encountered),
+            "decisions_rationale": list(self.decisions_rationale),
         }
 
     def to_message_text(self) -> str:
@@ -67,15 +73,24 @@ class HistorySummary:
                 or ["- None"]
             ),
         ]
+        if self.active_topics:
+            sections.extend(["", "### Active Topics", *[f"- {item}" for item in self.active_topics]])
+        if self.errors_encountered:
+            sections.extend(["", "### Errors Encountered", *[f"- {item}" for item in self.errors_encountered]])
+        if self.decisions_rationale:
+            sections.extend(["", "### Decisions Rationale", *[f"- {item}" for item in self.decisions_rationale]])
         return "\n".join(sections).strip()
 
 
 class _HistorySummaryOutput(BaseModel):
-    # 结构化输出只保留当前阶段真正需要复用的 4 个字段。
+    # 结构化输出字段：核心 4 字段 + 扩展 3 字段。
     current_goal: str = Field(default="")
     key_constraints_and_decisions: list[str] = Field(default_factory=list)
     important_files_and_evidence: list[str] = Field(default_factory=list)
     unfinished_items: list[str] = Field(default_factory=list)
+    active_topics: list[str] = Field(default_factory=list)
+    errors_encountered: list[str] = Field(default_factory=list)
+    decisions_rationale: list[str] = Field(default_factory=list)
 
 
 SummaryGenerator = Callable[[list[TResponseInputItem], str], Awaitable[HistorySummary]]
@@ -181,10 +196,17 @@ def _is_summary_message(item: TResponseInputItem) -> bool:
     )
 
 
+_TOOL_OUTPUT_TYPES = frozenset({
+    "function_call_output",
+    "local_shell_call_output",
+    "shell_call_output",
+})
+
+
 def _get_tool_output_text(item: TResponseInputItem) -> str | None:
     raw_item = _item_to_dict(item)
     item_type = str(raw_item.get("type", ""))
-    if item_type not in {"function_call_output", "local_shell_call_output", "shell_call_output"}:
+    if item_type not in _TOOL_OUTPUT_TYPES:
         return None
     output = raw_item.get("output")
     return output if isinstance(output, str) else None
@@ -197,7 +219,7 @@ def _replace_tool_output(item: TResponseInputItem, output: str) -> TResponseInpu
 
 
 def _build_tool_call_name_map(items: list[TResponseInputItem]) -> dict[str, str]:
-    # micro_compact 需要把 call_id 还原成工具名，才能保留“之前用过什么工具”这层线索。
+    # micro_compact 需要把 call_id 还原成工具名，才能保留"之前用过什么工具"这层线索。
     name_map: dict[str, str] = {}
     for item in items:
         raw_item = _item_to_dict(item)
@@ -208,6 +230,28 @@ def _build_tool_call_name_map(items: list[TResponseInputItem]) -> dict[str, str]
         if isinstance(call_id, str) and isinstance(name, str):
             name_map[call_id] = name
     return name_map
+
+
+def _remove_orphaned_tool_pairs(items: list[TResponseInputItem]) -> list[TResponseInputItem]:
+    # 历史被切片或截断后，function_call 和 function_call_output 的 call_id 配对可能断裂。
+    # OpenAI API 严格要求每个 function_call_output 都有对应的 function_call，否则返回 400。
+    call_ids: set[str] = set()
+    for item in items:
+        raw_item = _item_to_dict(item)
+        if raw_item.get("type") == "function_call":
+            call_id = raw_item.get("call_id")
+            if isinstance(call_id, str):
+                call_ids.add(call_id)
+
+    cleaned: list[TResponseInputItem] = []
+    for item in items:
+        raw_item = _item_to_dict(item)
+        if str(raw_item.get("type", "")) in _TOOL_OUTPUT_TYPES:
+            call_id = raw_item.get("call_id")
+            if isinstance(call_id, str) and call_id not in call_ids:
+                continue
+        cleaned.append(item)
+    return cleaned
 
 
 def _build_tool_placeholder(tool_name: str) -> str:
@@ -226,7 +270,7 @@ def micro_compact_history_items(
         index
         for index, item in enumerate(items)
         if _get_tool_output_text(item) is not None
-    ]
+    ]  #找出所有 tool_result 项
     if len(tool_result_indices) < active_config.min_tool_results_before_compact:
         return list(items), MicroCompactStats(
             total_tool_results=len(tool_result_indices),
@@ -234,7 +278,7 @@ def micro_compact_history_items(
         )
 
     keep_from = max(0, len(tool_result_indices) - active_config.keep_recent_tool_results)
-    kept_indices = set(tool_result_indices[keep_from:])
+    kept_indices = set(tool_result_indices[keep_from:])  #保留最近的 tool_result 项
     compacted_items: list[TResponseInputItem] = []
     replaced_count = 0
 
@@ -275,6 +319,7 @@ def estimate_context_tokens(
     history_items: list[TResponseInputItem],
     current_turn_items: list[TResponseInputItem],
 ) -> int:
+    """用 tiktoken 对 整个上下文 做 token 估算"""
     # 这里先做“调用前本地估算”，避免把是否压缩完全交给上一次 API usage。
     try:
         encoding = tiktoken.encoding_for_model(model)
@@ -351,6 +396,21 @@ async def generate_history_summary(
             for item in summary_output.unfinished_items
             if item.strip()
         ],
+        active_topics=[
+            item.strip()
+            for item in summary_output.active_topics
+            if item.strip()
+        ],
+        errors_encountered=[
+            item.strip()
+            for item in summary_output.errors_encountered
+            if item.strip()
+        ],
+        decisions_rationale=[
+            item.strip()
+            for item in summary_output.decisions_rationale
+            if item.strip()
+        ],
     )
 
 
@@ -406,7 +466,7 @@ async def compact_session_history(
 
     # session 中只保留一个 summary 项；旧 summary 也会被这次新摘要吸收进来。
     non_summary_items = [item for item in raw_items if not _is_summary_message(item)]
-    recent_items = non_summary_items[-active_config.keep_recent_items :]
+    recent_items = _remove_orphaned_tool_pairs(non_summary_items[-active_config.keep_recent_items :])
     await session.clear_session()
     await session.add_items([build_summary_message_item(summary), *recent_items])
     return SessionCompactionResult(
@@ -429,8 +489,8 @@ async def prepare_history_for_model(
     config: ContextCompactionConfig | None = None,
 ) -> PreparedHistory:
     # 这是 L3 的统一入口：先做 view 级 micro_compact，再按 token 估算决定是否真的改写 session。
-    active_config = config or get_context_compaction_config()
-    raw_items = list(await session.get_items())
+    active_config = config or get_context_compaction_config()  #获取配置
+    raw_items = list(await session.get_items()) #读取原始历史
     history_items, micro_stats = micro_compact_history_items(raw_items, config=active_config.micro)
     estimated_tokens = estimate_context_tokens(
         model=model,
@@ -438,7 +498,7 @@ async def prepare_history_for_model(
         repo_rule_text=repo_rule_text,
         history_items=history_items,
         current_turn_items=current_turn_items,
-    )
+    ) 
     auto_compacted = False
     archive_path: str | None = None
     summary = existing_summary
@@ -466,7 +526,7 @@ async def prepare_history_for_model(
             )
 
     return PreparedHistory(
-        history_items=history_items,
+        history_items=_remove_orphaned_tool_pairs(history_items),
         summary=summary,
         compaction={
             "token_estimator": "tiktoken",

@@ -24,6 +24,8 @@ if TYPE_CHECKING:
     from src.runtime.session import CliSessionRuntime
 
 CODE_LAW_FILENAME = "code_law.md"
+REPO_RULES_DIR = ".nanocodex"
+REPO_RULES_SUBDIR = "rules"
 LONG_TERM_MEMORY_PREVIEW_CHAR_BUDGET = 2_000
 LONG_TERM_MEMORY_PREVIEW_LINE_BUDGET = 80
 
@@ -79,7 +81,8 @@ Long-Term Memory
 - Use long-term memory for stable user preferences, durable feedback, long-term collaboration preferences, stable project conventions, and durable reference notes.
 - If the user explicitly says "remember this", you must write or update long-term memory.
 - If the user explicitly says "forget this", "forget", or says not to remember something, you must delete or update the corresponding long-term memory.
-- Before writing long-term memory, read MEMORY.md first, deduplicate against existing entries, and prefer updating an existing topic file over creating a duplicate.
+- Before writing long-term memory, try to read MEMORY.md first, deduplicate against existing entries, and prefer updating an existing topic file over creating a duplicate.
+- If MEMORY.md or the memory directory does not exist yet, create it together with the first topic file using the Write tool. Do not skip writing just because the file was not found.
 - MEMORY.md is an index. Topic files hold the details and must include frontmatter with name, description, type, and updated_at.
 - Valid long-term memory types are user, feedback, project, and reference.
 - When you create, rename, update, or delete a topic file, keep MEMORY.md synchronized in the same save operation.
@@ -199,9 +202,9 @@ class StableContextLayer:
 
 @dataclass(frozen=True, slots=True)
 class RepoRuleLayer:
-    # L2 是仓库本地规则文档；当前阶段固定读取项目根目录的 code_law.md。
-    path: Path | None
-    content: str
+    # L2 是仓库本地规则文档；支持 .nanocodex/rules/ 目录下多文件和 code_law.md 后备。
+    rules: tuple[tuple[str, str], ...]  # (name, content) 对
+    available: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,16 +248,13 @@ class ContextBundle:
             self.stable.tool_rules,
             "</tool-rules>",
         ]
-        if self.repo_rule.content:
-            sections.extend(
-                [
-                    "",
-                    "<repository-rules>",
-                    f"Code Law ({self.repo_rule.path.name if self.repo_rule.path else 'code_law.md'}):",
-                    self.repo_rule.content,
-                    "</repository-rules>",
-                ]
-            )
+        if self.repo_rule.available:
+            sections.append("")
+            sections.append("<repository-rules>")
+            for name, content in self.repo_rule.rules:
+                sections.append(f"--- {name} ---")
+                sections.append(content)
+            sections.append("</repository-rules>")
         sections.extend(
             [
                 "",
@@ -345,12 +345,28 @@ def build_stable_context_layer(
 
 
 def build_repo_rule_layer(*, workspace_root: Path | None = None) -> RepoRuleLayer:
-    path = (workspace_root or get_default_workspace_root()).resolve() / CODE_LAW_FILENAME
-    if not path.exists():
-        return RepoRuleLayer(path=None, content="")
+    root = (workspace_root or get_default_workspace_root()).resolve()
+    rules_dir = root / REPO_RULES_DIR / REPO_RULES_SUBDIR
+    rules: list[tuple[str, str]] = []
+
+    # 优先读取 .nanocodex/rules/ 目录下的所有 .md 文件。
+    if rules_dir.is_dir():
+        for md_file in sorted(rules_dir.glob("*.md")):
+            content = md_file.read_text(encoding="utf-8").strip()
+            if content:
+                rules.append((md_file.stem, content))
+
+    # 后备：如果没有 rules 目录或目录为空，回退到读取 code_law.md。
+    if not rules:
+        legacy_path = root / CODE_LAW_FILENAME
+        if legacy_path.exists():
+            content = legacy_path.read_text(encoding="utf-8").strip()
+            if content:
+                rules.append((CODE_LAW_FILENAME, content))
+
     return RepoRuleLayer(
-        path=path,
-        content=path.read_text(encoding="utf-8").strip(),
+        rules=tuple(rules),
+        available=bool(rules),
     )
 
 
@@ -422,12 +438,11 @@ def _render_long_term_memory_section(layer: LongTermMemoryLayer) -> str:
 
 
 def _build_background_results_item(notifications: list[dict[str, object]]) -> TResponseInputItem:
-    # 后台结果只回注入简短摘要，完整日志仍留在任务图或产物文件里回查。
     lines = ["<background-results>"]
     lines.extend(f"- {item['text']}" for item in notifications)
     lines.append("</background-results>")
     return {
-        "role": "system",
+        "role": "user",
         "content": "\n".join(lines),
     }
 
@@ -488,13 +503,13 @@ async def build_context_bundle(
     stable_layer = build_stable_context_layer(
         tool_names,
         skill_loader=skill_loader,
-    )
-    repo_rule_layer = build_repo_rule_layer(workspace_root=active_workspace_root)
-    long_term_memory_layer = build_long_term_memory_layer(workspace_root=active_workspace_root)
+    )  #跨会话不变的内容
+    repo_rule_layer = build_repo_rule_layer(workspace_root=active_workspace_root)  #仓库本地规则
+    long_term_memory_layer = build_long_term_memory_layer(workspace_root=active_workspace_root) #跨会话的长期记忆
     preprocessed_input = preprocess_user_input(
         user_input,
         workspace_root=active_execution_root,
-    )
+    )  #预处理用户输入，处理用户输入中的 @file 语法引用
     current_turn_items = list(preprocessed_input.current_turn_items)
     history_items: list[TResponseInputItem] = []
     summary: HistorySummary | None = None

@@ -4,6 +4,7 @@ from src.context import build_repo_rule_layer, build_stable_context_layer
 from src.tools.registry import AGENT_TOOLS
 
 def _build_default_instructions() -> str:
+    """构建默认的系统提示词和工具规则。"""
     # 这里复用 context builder 的 L1/L2 拼装，避免稳定提示词再次散落回 runtime。
     stable_layer = build_stable_context_layer([tool.name for tool in AGENT_TOOLS])
     repo_rule_layer = build_repo_rule_layer()

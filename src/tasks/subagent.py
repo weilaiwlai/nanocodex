@@ -70,6 +70,7 @@ async def run_subagent_task(
             agent,
             input=str(prompt),
             context=runtime_context,
+            max_turns=25,
         )
     except Exception as exc:
         failed_task = update_task(

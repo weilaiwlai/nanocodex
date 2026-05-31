@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from hashlib import sha1
 from typing import Literal, TypedDict
+from uuid import uuid4
 
 from agents import RunContextWrapper, function_tool
 
@@ -45,7 +46,29 @@ def _normalize_summary(summary: str) -> str:
     return summary.strip()
 
 
-def _normalize_todos(todos: list[TodoInputItem]) -> list[dict[str, str]]:
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _match_todo_id(
+    content: str,
+    previous_todos: list[dict[str, str]] | None,
+    used_ids: set[str],
+) -> str:
+    # 尝试通过内容匹配之前的 todo，保留其 id 以维持跨更新追踪。
+    if previous_todos:
+        for prev in previous_todos:
+            if prev.get("content") == content and prev.get("id") not in used_ids:
+                used_ids.add(prev["id"])
+                return prev["id"]
+    return f"todo-{uuid4().hex[:8]}"
+
+
+def _normalize_todos(
+    todos: list[TodoInputItem],
+    *,
+    previous_todos: list[dict[str, str]] | None = None,
+) -> list[dict[str, str]]:
     if not isinstance(todos, list) or not todos:
         raise ToolFailure(
             code="INVALID_PARAM",
@@ -61,6 +84,7 @@ def _normalize_todos(todos: list[TodoInputItem]) -> list[dict[str, str]]:
 
     normalized: list[dict[str, str]] = []
     in_progress_count = 0
+    used_ids: set[str] = set()
 
     # 这里显式逐项校验，避免模型把非法状态或空内容悄悄塞进当前计划。
     for index, item in enumerate(todos, start=1):
@@ -97,7 +121,17 @@ def _normalize_todos(todos: list[TodoInputItem]) -> list[dict[str, str]]:
         if status == "in_progress":
             in_progress_count += 1
 
-        normalized.append({"content": content, "status": status})
+        todo_id = _match_todo_id(content, previous_todos, used_ids)
+        # 匹配到已有 todo 时保留原始 created_at，否则生成新时间戳。
+        created_at = ""
+        if previous_todos:
+            for prev in previous_todos:
+                if prev.get("id") == todo_id:
+                    created_at = prev.get("created_at", "")
+                    break
+        if not created_at:
+            created_at = _utc_now()
+        normalized.append({"id": todo_id, "content": content, "status": status, "created_at": created_at})
 
     if in_progress_count > 1:
         raise ToolFailure(
@@ -266,7 +300,14 @@ def todo_write(
 
     try:
         normalized_summary = _normalize_summary(summary)
-        normalized_todos = _normalize_todos(todos)
+        # 将已有 todo 传入 normalize，用于跨更新追踪 id。
+        previous_todos = None
+        if active_runtime_context.todo_state is not None:
+            previous_todos = [
+                {"id": item.id, "content": item.content, "status": item.status, "created_at": item.created_at}
+                for item in active_runtime_context.todo_state.todos
+            ]
+        normalized_todos = _normalize_todos(todos, previous_todos=previous_todos)
         recap = _build_recap(normalized_todos)
         active_runtime_context.set_todo_state(normalized_summary, normalized_todos, recap)
 

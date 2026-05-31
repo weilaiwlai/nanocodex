@@ -16,12 +16,12 @@ class ToolError(TypedDict):
 
 
 class ToolResponse(TypedDict):
-    status: ToolStatus
-    data: ToolData
-    text: str
-    stats: ToolStats
-    context: ToolContext
-    error: ToolError | None
+    status: ToolStatus  #工具响应状态，success、partial或error
+    data: ToolData  #工具返回的 JSON 数据，根据 status 不同而不同
+    text: str  #工具返回的文本内容，根据 status 不同而不同
+    stats: ToolStats  #工具运行统计信息，包含 time_ms 等字段
+    context: ToolContext  #工具运行上下文，包含 cwd、params_input 等字段
+    error: ToolError | None  #工具运行错误信息，仅在 status 为 error 时存在
 
 
 def _validate_common_fields(*, data: ToolData, stats: ToolStats, context: ToolContext) -> None:

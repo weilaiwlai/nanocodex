@@ -102,7 +102,7 @@ def _worktree_closeout(
     action: str,
     runtime_context: ToolRuntimeContext | None = None,
 ) -> ToolResponse:
-    # closeout 当前只支持 keep/remove，两种动作都围绕 task 绑定 worktree 展开。
+    # closeout 支持 keep / remove / merge 三种动作。
     start_time = start_timer()
     params_input = {"task_id": task_id, "action": action}
     try:
@@ -197,7 +197,7 @@ worktree_list_tool = function_tool(
 worktree_closeout_tool = function_tool(
     _worktree_closeout_tool,
     name_override="WorktreeCloseout",
-    description_override="对某个任务绑定的 worktree 执行 closeout；action 只支持 keep 或 remove。",
+    description_override="对某个任务绑定的 worktree 执行 closeout；action 支持 keep、remove 或 merge（合并回主分支）。",
 )
 
 WORKTREE_TOOLS = [

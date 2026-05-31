@@ -57,6 +57,7 @@ def _spawn_teammate(
     name: str,
     role: str,
     prompt: str,
+    persistent: bool = False,
     runtime_context: ToolRuntimeContext | None = None,
 ) -> ToolResponse:
     # 这里先只包装 team runtime 的最小创建能力，不顺手做 task/worktree 绑定。
@@ -65,6 +66,7 @@ def _spawn_teammate(
         "name": name,
         "role": role,
         "prompt": prompt,
+        "persistent": persistent,
     }
     try:
         if runtime_context is None:
@@ -78,6 +80,7 @@ def _spawn_teammate(
             name=name,
             role=role,
             prompt=prompt,
+            persistent=persistent,
         )
         public_result = _public_team_view(result)
         member = result["member"]
@@ -442,12 +445,14 @@ def _spawn_teammate_tool(
     name: str,
     role: str,
     prompt: str,
+    persistent: bool = False,
 ) -> ToolResponse:
     # SDK function tool wrapper 只负责接 RunContextWrapper，再转发给纯函数主体。
     params_input = {
         "name": name,
         "role": role,
         "prompt": prompt,
+        "persistent": persistent,
     }
     return run_traced_tool(
         ctx.context,
@@ -457,6 +462,7 @@ def _spawn_teammate_tool(
             name=name,
             role=role,
             prompt=prompt,
+            persistent=persistent,
             runtime_context=ctx.context,
         ),
     )

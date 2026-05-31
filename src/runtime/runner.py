@@ -29,7 +29,7 @@ def configure_openai_runtime(config: RuntimeConfig) -> None:
         client = AsyncOpenAI(
             base_url=config.base_url,
             api_key=config.api_key,
-            timeout=30.0,
+            timeout=120.0,
         )
         set_default_openai_client(client, use_for_tracing=False)
         # 先与已验证稳定的兼容性探针保持一致，后续再逐步接入 tracing 和 session。
@@ -62,7 +62,7 @@ async def run_events(
     session_runtime: CliSessionRuntime | None = None,
 ) -> AsyncIterator[dict[str, object]]:
     """执行一次流式 agent 运行，并统一产出结构化 runtime 事件。"""
-    configure_openai_runtime(config)
+    configure_openai_runtime(config)  #设置 SDK 默认客户端
     active_context = session_runtime.context if session_runtime is not None else None
     run_id = (
         active_context.start_trace_run(user_input=user_input, model=config.model)
@@ -94,7 +94,7 @@ async def run_events(
             session_runtime=session_runtime,
             tool_names=[tool.name for tool in AGENT_TOOLS],
             model_name=config.model,
-        )
+        )  #构建上下文包，包含历史消息、当前轮消息、提及文件等
         if active_context is not None:
             active_context.log_trace_context_build(
                 {
@@ -129,7 +129,7 @@ async def run_events(
         agent = build_root_agent(
             model=config.model,
             instructions=context_bundle.build_agent_instructions(),
-        )
+        )  #创建 Agent 实例
         run_config = None
         if session_runtime is not None:
             # micro_compact 只影响“本轮送给模型的输入视图”，不直接改写底层 session 原文。
@@ -142,9 +142,10 @@ async def run_events(
             session=session_runtime.session if session_runtime is not None else None,
             context=session_runtime.context if session_runtime is not None else None,
             run_config=run_config,
-        )
+            max_turns=50,
+        )  #流式运行 Agent 实例
 
-        async for event in result.stream_events():
+        async for event in result.stream_events():      #逐个产出结构化事件
             # 这里严格对齐官方 streaming 示例，避免误判事件层级。
             if (
                 event.type == "raw_response_event"
@@ -160,7 +161,7 @@ async def run_events(
                 usage = extract_usage_from_raw_event_data(event.data) or usage
             if event.type == "run_item_stream_event" and isinstance(event.item, ToolCallItem):
                 if event.name == "tool_called":
-                    payload = summarize_tool_call(event.item)
+                    payload = summarize_tool_call(event.item)   #提取工具调用的参数
                     pending_tool_names.append(str(payload["tool_name"]))
                     yield event_builder.build("tool_intent", payload)
                     yield event_builder.build("tool_started", payload)

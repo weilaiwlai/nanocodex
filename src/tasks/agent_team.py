@@ -9,9 +9,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from agents import Agent, Runner
+from agents import Agent, Runner, SQLiteSession
 
 from src.runtime.session import ToolRuntimeContext
+from src.runtime.tracing import build_trace_logger
 from src.tasks.task_graph import claim_task as claim_persistent_task, renew_task_lease, update_task
 from src.tasks.task_store import get_task
 from src.tasks.worktrees import ensure_task_worktree
@@ -21,10 +22,10 @@ from src.tools.edit_write import FILE_EDIT_TOOLS
 from src.tools.bash_tool import BASH_TOOLS
 from src.tools.task_tools import TASK_TOOLS
 
-# 这个模块当前覆盖 AgentTeam phase 1 到 phase 3 的最小闭环：
-# team-lead、长寿命 teammate、内存消息队列、transcript，
-# 再加上 phase 2 的请求协议和 phase 3 的 task claim / lease / heartbeat。
-# worktree、独立 session 仍然留到后续阶段。
+# 这个模块覆盖 AgentTeam phase 1 到 phase 4 的闭环：
+# team-lead、长寿命 teammate、独立 SQLiteSession、内存消息队列、transcript，
+# phase 2 的请求协议、phase 3 的 task claim / lease / heartbeat，
+# 以及 phase 4 的独立 session 和 worktree 绑定。
 TEAM_TASK_LEASE_SECONDS = 30
 
 
@@ -34,7 +35,7 @@ def _utc_now() -> str:
 
 def _build_default_team_state(*, session_id: str, session_name: str) -> dict[str, object]:
     now = _utc_now()
-    # team_id 直接稳定绑定 session，Phase 1 不再额外设计独立 team 命名策略。
+    # team_id 直接稳定绑定 session，team_name 允许自定义覆盖。
     return {
         "team_id": f"team-{session_id}",
         "team_name": f"{session_name} Team",
@@ -47,7 +48,7 @@ def _build_default_team_state(*, session_id: str, session_name: str) -> dict[str
 
 
 def _normalize_member_status(member: dict[str, object]) -> bool:
-    # Phase 1 的 teammate 只活在当前进程里，重启后要把旧活动状态诚实改成 stopped。
+    # 重启后要把旧活动状态诚实改成 stopped，后续由恢复逻辑决定是否重新 spawn。
     status = str(member.get("status") or "")
     if status in {"spawning", "working", "idle", "stopping"}:
         member["status"] = "stopped"
@@ -55,17 +56,31 @@ def _normalize_member_status(member: dict[str, object]) -> bool:
     return False
 
 
+def _generate_span_id() -> str:
+    return f"span-{uuid4().hex[:10]}"
+
+
 def _build_transcript_event(
     *,
     event_type: str,
     payload: dict[str, object],
+    span_id: str | None = None,
+    parent_span_id: str | None = None,
+    duration_ms: int | None = None,
 ) -> dict[str, object]:
-    # transcript 先只保留调试和回放必需字段，不在 Phase 1 里做复杂 span 结构。
-    return {
+    # transcript event 支持 span 结构，用于追踪 agent run 和 tool call 的层级关系。
+    event: dict[str, object] = {
         "event_type": event_type,
         "created_at": _utc_now(),
         **payload,
     }
+    if span_id is not None:
+        event["span_id"] = span_id
+    if parent_span_id is not None:
+        event["parent_span_id"] = parent_span_id
+    if duration_ms is not None:
+        event["duration_ms"] = duration_ms
+    return event
 
 
 def _write_json_file(path: Path, payload: dict[str, object]) -> None:
@@ -130,7 +145,7 @@ def _build_teammate_identity_input(
     worker: "TeammateWorker",
     current_task_id: int | None,
 ) -> dict[str, str]:
-    # 这层 stable reinjection 用来告诉 teammate“我是谁、当前归属什么任务”。
+    # 这层 stable reinjection 用来告诉 teammate"我是谁、当前归属什么任务"。
     # 它不依赖历史 transcript，所以不会被 compact 吞掉。
     current_task_text = str(current_task_id) if current_task_id is not None else "none"
     content = "\n".join(
@@ -152,22 +167,25 @@ def _build_teammate_identity_input(
     }
 
 
-def _build_teammate_instructions(*, name: str, role: str, prompt: str) -> str:
-    # teammate 的 prompt 只解释身份和协作方式，不把主代理的整套 L1 再复制一遍。
+def _build_teammate_instructions(*, name: str, role: str) -> str:
     sections = [
         f"You are teammate '{name}'.",
         f"Your role is: {role}.",
         "You are a long-lived worker inside the current team.",
-        "Read team messages, use tools if needed, and work on the current request only.",
-        "If there is no direct message, you may claim one available task from the task board.",
-        "If you need to report progress or results back to team-lead, use the SendMessage tool.",
-        "If you need to explicitly claim an available task, use the ClaimTask tool.",
-        "If you need lead to review a plan, use the PlanApproval tool in request mode.",
+        "",
+        "When you receive a task or message, you MUST use the available tools to complete it:",
+        "- Use Glob to list files and directories",
+        "- Use Read to read file contents",
+        "- Use Grep to search for patterns in code",
+        "- Use Bash to run shell commands when needed",
+        "- Use TaskCreate / TaskList / TaskGet / TaskUpdate to manage persistent tasks",
+        "",
+        "After completing your work, report results back to team-lead using SendMessage.",
+        "If there is no direct message, claim an available task from the task board using ClaimTask.",
+        "If you need lead to review a plan, use PlanApproval in request mode.",
         "Do not spawn new teammates.",
+        "Never return an empty response. Always produce meaningful output.",
     ]
-    cleaned_prompt = prompt.strip()
-    if cleaned_prompt:
-        sections.extend(["", cleaned_prompt])
     return "\n".join(sections).strip()
 
 
@@ -205,9 +223,9 @@ class TeammateWorker:
     transcript_path: Path
     recent_transcript_path: Path
     context: ToolRuntimeContext
+    sdk_session: SQLiteSession
     message_queue: queue.Queue[dict[str, object]]
     stop_event: threading.Event = field(default_factory=threading.Event)
-    history_items: list[dict[str, object]] = field(default_factory=list)
     thread: threading.Thread | None = None
 
 
@@ -219,16 +237,20 @@ class AgentTeamRuntime:
         session_name: str,
         team_dir: Path,
         base_context: ToolRuntimeContext,
+        team_name: str | None = None,
     ) -> None:
         # team runtime 绑定到一个 session，下层所有 teammate 都共享这套根目录。
         self.session_id = session_id
         self.session_name = session_name
         self.team_dir = team_dir
         self.base_context = base_context
+        self._custom_team_name = team_name
         self.transcripts_dir = self.team_dir / "transcripts"
+        self.sessions_dir = self.team_dir / "sessions"
         self.state_path = self.team_dir / "team_state.json"
         self.request_tracker_path = self.team_dir / "request_tracker.json"
         self.transcripts_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._lead_queue: queue.Queue[dict[str, object]] = queue.Queue()
         self._lead_state_queue: queue.Queue[dict[str, object]] = queue.Queue()
@@ -245,11 +267,17 @@ class AgentTeamRuntime:
                 session_id=self.session_id,
                 session_name=self.session_name,
             )
+            if self._custom_team_name:
+                state["team_name"] = self._custom_team_name
             self._save_state(state)
             return state
 
         state = json.loads(self.state_path.read_text(encoding="utf-8"))
         changed = False
+        # 允许自定义 team_name 覆盖持久化的值。
+        if self._custom_team_name and state.get("team_name") != self._custom_team_name:
+            state["team_name"] = self._custom_team_name
+            changed = True
         for member in state.get("members", []):
             changed = _normalize_member_status(member) or changed
         if changed:
@@ -258,7 +286,7 @@ class AgentTeamRuntime:
         return state
 
     def _save_state(self, state: dict[str, object]) -> None:
-        # Phase 1 先保持最直接的 JSON 落盘，不额外引入 store 抽象。
+        # 保持直接的 JSON 落盘，不额外引入 store 抽象。
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_file(self.state_path, state)
 
@@ -273,6 +301,77 @@ class AgentTeamRuntime:
     def _save_request_tracker(self, tracker: dict[str, dict[str, object]]) -> None:
         self.request_tracker_path.parent.mkdir(parents=True, exist_ok=True)
         _write_json_file(self.request_tracker_path, tracker)
+
+    def _recover_teammates(self) -> None:
+        # 从 team_state.json 恢复上次会话的 teammate。
+        # 只恢复有未完成 task 或标记为 persistent 的 member。
+        recoverable = []
+        with self._lock:
+            for member in self._state["members"]:
+                status = str(member.get("status") or "")
+                if status != "stopped":
+                    continue
+                if member.get("current_task_id") is not None or member.get("persistent"):
+                    recoverable.append(dict(member))
+                    member["status"] = "recovering"
+            if recoverable:
+                self._state["updated_at"] = _utc_now()
+                self._save_state(self._state)
+
+        for member_info in recoverable:
+            try:
+                self._respawn_from_member(member_info)
+            except Exception as exc:
+                # 单个 teammate 恢复失败不影响其他 teammate。
+                name = str(member_info.get("name") or member_info.get("agent_id") or "unknown")
+                try:
+                    self._update_member(name, status="failed")
+                except Exception:
+                    pass
+
+    def _respawn_from_member(self, member_info: dict[str, object]) -> None:
+        # 用已有 member 信息重新创建 worker 并启动线程。
+        # SQLiteSession 用相同的 session_id 打开同一 DB 文件，自动恢复对话历史。
+        agent_id = str(member_info["agent_id"])
+        name = str(member_info["name"])
+        role = str(member_info.get("role") or "")
+        prompt = str(member_info.get("prompt") or "")
+        transcript_path = Path(str(member_info["transcript_path"]))
+        if not transcript_path.is_absolute():
+            transcript_path = self.base_context.session_dir / transcript_path
+        recent_transcript_path = transcript_path.with_name(f"{agent_id}_recent.json")
+
+        teammate_session = SQLiteSession(
+            session_id=agent_id,
+            db_path=self.sessions_dir / f"{agent_id}.db",
+        )
+        worker = TeammateWorker(
+            agent_id=agent_id,
+            name=name,
+            role=role,
+            prompt=prompt,
+            transcript_path=transcript_path,
+            recent_transcript_path=recent_transcript_path,
+            context=self._build_worker_context(name=name, agent_id=agent_id, sdk_session=teammate_session),
+            sdk_session=teammate_session,
+            message_queue=queue.Queue(),
+        )
+        thread = threading.Thread(
+            target=self._run_worker_loop,
+            args=(worker,),
+            daemon=True,
+            name=f"teammate-{name}",
+        )
+        worker.thread = thread
+        self._workers[name] = worker
+        thread.start()
+        self.send_message(
+            from_name="team-lead",
+            to_name=name,
+            content=f"会话恢复：teammate '{name}' 已重新上线。",
+            summary="teammate 恢复通知",
+            message_type="message",
+        )
 
     def _find_member(self, name: str) -> dict[str, object] | None:
         for member in self._state["members"]:
@@ -387,12 +486,11 @@ class AgentTeamRuntime:
             self._save_request_tracker(self._request_tracker)
             return dict(record)
 
-    def _build_worker_context(self, *, name: str) -> ToolRuntimeContext:
-        # teammate 复用同一 session 目录，但保持独立的运行时上下文和 actor 身份。
+    def _build_worker_context(self, *, name: str, agent_id: str, sdk_session: SQLiteSession) -> ToolRuntimeContext:
         return ToolRuntimeContext(
             session_id=self.base_context.session_id,
             session_name=self.base_context.session_name,
-            session=self.base_context.session,
+            session=sdk_session,
             session_root=self.base_context.session_root,
             session_dir=self.base_context.session_dir,
             tasks_dir=self.base_context.tasks_dir,
@@ -406,7 +504,10 @@ class AgentTeamRuntime:
             light_model=self.base_context.light_model,
             actor_name=name,
             team_runtime=self,
-            trace_logger=None,
+            trace_logger=build_trace_logger(
+                f"{self.base_context.session_id}-{agent_id}",
+                trace_dir=self.base_context.traces_dir,
+            ),
         )
 
     def _claim_task_for_worker(self, worker: TeammateWorker) -> dict[str, object] | None:
@@ -527,7 +628,7 @@ class AgentTeamRuntime:
 
     def _run_worker_loop(self, worker: TeammateWorker) -> None:
         # teammate 的生命周期是：创建后先进入 working，再立即转成 idle 等待消息。
-        # 这能保证它“活着”，但不会在无任务时空转占用太多资源。
+        # 这能保证它"活着"，但不会在无任务时空转占用太多资源。
         self._update_member(worker.name, status="working")
         self._append_transcript_event(
             worker,
@@ -536,6 +637,18 @@ class AgentTeamRuntime:
                 payload={"status": "working", "name": worker.name},
             ),
         )
+
+        # 将 identity 信息写入独立 session，作为 teammate 的持久自我认知。
+        # 恢复场景下 session 已有历史，不再重复注入。
+        existing_items = asyncio.run(worker.sdk_session.get_items(limit=1))
+        if not existing_items:
+            identity_input = _build_teammate_identity_input(
+                team_id=str(self._state["team_id"]),
+                worker=worker,
+                current_task_id=None,
+            )
+            asyncio.run(worker.sdk_session.add_items([identity_input]))
+
         self._update_member(worker.name, status="idle")
 
         while not worker.stop_event.is_set():
@@ -570,16 +683,17 @@ class AgentTeamRuntime:
 
             # 普通消息会先写 transcript，再交给 teammate 跑一轮。
             self._update_member(worker.name, status="working")
+            run_span_id = _generate_span_id()
             if claimed_task is None:
                 self._append_transcript_event(
                     worker,
                     _build_transcript_event(
                         event_type="message",
                         payload=message,
+                        span_id=run_span_id,
                     ),
                 )
                 current_input = _build_message_input(message)
-                current_task_id = None
             else:
                 self._renew_task_lease_for_worker(worker, task_id=int(claimed_task["id"]))
                 claimed_task = self._bind_task_execution_root_for_worker(
@@ -587,45 +701,40 @@ class AgentTeamRuntime:
                     task=claimed_task,
                 )
                 current_input = _build_task_input(claimed_task)
-                current_task_id = int(claimed_task["id"])
 
             agent = Agent(
                 name=worker.name,
                 instructions=_build_teammate_instructions(
                     name=worker.name,
                     role=worker.role,
-                    prompt=worker.prompt,
                 ),
                 model=worker.context.main_model or worker.context.current_model or "gpt-5.2-codex",
                 tools=_build_teammate_tools(),
             )
-            input_items = [
-                _build_teammate_identity_input(
-                    team_id=str(self._state["team_id"]),
-                    worker=worker,
-                    current_task_id=current_task_id,
-                ),
-                *worker.history_items,
-                current_input,
-            ]
 
+            run_start_ms = int(datetime.now().timestamp() * 1000)
             try:
-                # Phase 1 不给 teammate 独立 session。
-                # 所以这里用 to_input_list() 回收上一轮历史，作为下一轮输入。
+                # 每个 teammate 拥有独立 SQLiteSession，由 SDK 管理对话历史和持久化。
                 result = asyncio.run(
                     Runner.run(
                         agent,
-                        input=input_items,
+                        input=[current_input],
+                        session=worker.sdk_session,
                         context=worker.context,
+                        max_turns=30,
                     )
                 )
             except Exception as exc:
+                run_duration_ms = int(datetime.now().timestamp() * 1000) - run_start_ms
                 # 这里只把 teammate 标成 failed，不在这里打复杂恢复补丁。
                 self._append_transcript_event(
                     worker,
                     _build_transcript_event(
                         event_type="error",
                         payload={"message": str(exc)},
+                        span_id=_generate_span_id(),
+                        parent_span_id=run_span_id,
+                        duration_ms=run_duration_ms,
                     ),
                 )
                 if claimed_task is not None:
@@ -640,16 +749,25 @@ class AgentTeamRuntime:
                 self._update_member(worker.name, status="failed")
                 return
 
-            # teammate 的“跨调用记忆”先存在进程内 history_items，完整轨迹仍写 transcript。
-            worker.history_items = list(result.to_input_list())
+            run_duration_ms = int(datetime.now().timestamp() * 1000) - run_start_ms
             final_output = result.final_output if isinstance(result.final_output, str) else str(result.final_output or "")
             self._append_transcript_event(
                 worker,
                 _build_transcript_event(
                     event_type="assistant",
                     payload={"content": final_output},
+                    span_id=run_span_id,
+                    duration_ms=run_duration_ms,
                 ),
             )
+            if not final_output.strip():
+                self.send_message(
+                    from_name=worker.name,
+                    to_name="team-lead",
+                    content="(teammate 本轮未产生可读输出)",
+                    summary="空回复通知",
+                    message_type="message",
+                )
             if claimed_task is None:
                 self._update_member(worker.name, status="idle")
             else:
@@ -669,7 +787,7 @@ class AgentTeamRuntime:
             ),
         )
 
-    def spawn_teammate(self, *, name: str, role: str, prompt: str) -> dict[str, object]:
+    def spawn_teammate(self, *, name: str, role: str, prompt: str, persistent: bool = False) -> dict[str, object]:
         with self._lock:
             existing_member = self._find_member(name)
             existing_status = str(existing_member.get("status") or "") if existing_member is not None else ""
@@ -689,9 +807,11 @@ class AgentTeamRuntime:
                 "agent_id": agent_id,
                 "name": name,
                 "role": role,
+                "prompt": prompt,
                 "status": "spawning",
                 "current_task_id": None,
                 "current_worktree": None,
+                "persistent": persistent,
                 "transcript_path": str(transcript_path.relative_to(self.base_context.session_dir)),
             }
             if existing_member is None:
@@ -704,6 +824,11 @@ class AgentTeamRuntime:
 
         # 真正的 worker 线程在状态落盘之后再启动，避免 UI 先看到线程活着但 state 还没写。
         # 如果这是一次重建，新的 worker 会覆盖旧的进程内句柄。
+        # 每个 teammate 拥有独立 SQLiteSession，历史由 SDK 自动管理和持久化。
+        teammate_session = SQLiteSession(
+            session_id=agent_id,
+            db_path=self.sessions_dir / f"{agent_id}.db",
+        )
         worker = TeammateWorker(
             agent_id=agent_id,
             name=name,
@@ -711,7 +836,8 @@ class AgentTeamRuntime:
             prompt=prompt,
             transcript_path=transcript_path,
             recent_transcript_path=recent_transcript_path,
-            context=self._build_worker_context(name=name),
+            context=self._build_worker_context(name=name, agent_id=agent_id, sdk_session=teammate_session),
+            sdk_session=teammate_session,
             message_queue=queue.Queue(),
         )
         thread = threading.Thread(
@@ -723,6 +849,13 @@ class AgentTeamRuntime:
         worker.thread = thread
         self._workers[name] = worker
         thread.start()
+        self.send_message(
+            from_name="team-lead",
+            to_name=name,
+            content=prompt,
+            summary="初始任务",
+            message_type="message",
+        )
         return {
             "team_id": self._state["team_id"],
             "member": dict(member),
@@ -1009,16 +1142,25 @@ class AgentTeamRuntime:
         for worker in list(self._workers.values()):
             if worker.thread is not None:
                 worker.thread.join(timeout=1)
+            worker.sdk_session.close()
 
 
-def build_agent_team_runtime(*, runtime_context: ToolRuntimeContext) -> AgentTeamRuntime:
+def build_agent_team_runtime(
+    *,
+    runtime_context: ToolRuntimeContext,
+    team_name: str | None = None,
+) -> AgentTeamRuntime:
     # team runtime 是 session 级对象，所以这里直接挂在 runtime_context 上复用。
-    return AgentTeamRuntime(
+    runtime = AgentTeamRuntime(
         session_id=runtime_context.session_id,
         session_name=runtime_context.session_name,
         team_dir=runtime_context.team_dir,
         base_context=runtime_context,
+        team_name=team_name,
     )
+    # 恢复上次会话中未完成的 teammate（有未完成 task 或标记为 persistent 的）。
+    runtime._recover_teammates()
+    return runtime
 
 
 def spawn_teammate(
@@ -1027,6 +1169,7 @@ def spawn_teammate(
     name: str,
     role: str,
     prompt: str,
+    persistent: bool = False,
 ) -> dict[str, object]:
     # 这些顶层 helper 只做一层薄转发，让 team_tools 和测试不用直接碰 runtime 内部字段。
     if runtime_context.team_runtime is None:
@@ -1035,7 +1178,9 @@ def spawn_teammate(
             message="当前没有 team runtime。",
             text="当前 session 还没有可用的 team runtime。",
         )
-    return runtime_context.team_runtime.spawn_teammate(name=name, role=role, prompt=prompt)
+    return runtime_context.team_runtime.spawn_teammate(
+        name=name, role=role, prompt=prompt, persistent=persistent,
+    )
 
 
 def list_teammates(runtime_context: ToolRuntimeContext) -> dict[str, object]:

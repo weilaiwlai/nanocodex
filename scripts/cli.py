@@ -72,7 +72,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def build_prompt_session() -> PromptSession[str]:
-    """终端交互留在 CLI 层，runtime 只关心模型运行。"""
+    """构建交互式输入终端，终端交互留在 CLI 层，runtime 只关心模型运行。"""
     keys = KeyBindings()
 
     @keys.add("enter")
@@ -97,6 +97,7 @@ def stream_reply(
     config: RuntimeConfig,
     session_runtime: CliSessionRuntime,
 ) -> None:
+    """同步包装：流式输出 Agent 回复,_stream_reply_events() 的 同步包装器"""
     session_runtime.update_name_from_user_input(user_input)
     print("Agent>")
     try:
@@ -111,6 +112,7 @@ async def _stream_reply_events(
     config: RuntimeConfig,
     session_runtime: CliSessionRuntime,
 ) -> None:
+    """异步核心：消费事件流并渲染"""
     # CLI 这一层现在只负责消费 runtime events，再决定哪些事件真正渲染给用户。
     printed_text = False
     async for event in run_events(
@@ -126,6 +128,7 @@ async def _stream_reply_events(
 
 
 def build_session_descriptor(session_runtime: CliSessionRuntime) -> dict[str, str]:
+    """构建会话描述符，包含会话 id、名称和 workspace"""
     # TUI 第一版只需要会话 id、名称和 workspace。
     return {
         "session_id": session_runtime.session_id,
@@ -141,6 +144,7 @@ async def emit_runtime_events_json(
     *,
     write,
 ) -> None:
+    """JSONL 模式输出事件,与 _stream_reply_events() 并列的另一种事件消费方式"""
     # JSONL 模式只暴露结构化事件，不混入当前 CLI 的人类可读渲染。
     async for event in run_events(
         user_input,
@@ -156,6 +160,7 @@ def render_runtime_event(
     write,
     printed_text: bool = False,
 ) -> bool:
+    """渲染 runtime event 到终端，返回是否需要刷新文本缓冲区"""
     # assistant 文本继续走主输出区，tool_result 默认只显示摘要，不把完整结果直接刷屏。
     event_type = event.get("type")
     payload = event.get("payload")
@@ -227,6 +232,7 @@ def render_runtime_event(
 
 
 def print_connection_error() -> None:
+    """打印模型连接失败提示"""
     # 连接失败属于 CLI 边界要兜住的外部错误，这里先转成可读提示，不在此处实现重试。
     print(
         "模型连接失败，请检查网络、OPENAI_BASE_URL 或上游服务状态后重试。",
@@ -241,6 +247,7 @@ def run_repl(
     new_session: bool = False,
     workspace_root: Path | None = None,
 ) -> int:
+    """运行交互式 REPL，处理用户输入并渲染模型回复"""
     session = build_prompt_session()
     try:
         session_runtime = build_cli_session_runtime(
@@ -291,7 +298,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.json_events and args.prompt is None:
         print("`--json-events` 只能和单次 prompt 一起使用。", file=sys.stderr)
         return 2
-    if args.list_sessions:
+    if args.list_sessions:  #列出所有会话
         sessions = list_saved_sessions()
         if not sessions:
             print("No saved sessions.")
@@ -303,7 +310,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    if args.print_session_json:
+    if args.print_session_json:  #打印会话描述符 JSON
         try:
             session_runtime = build_cli_session_runtime(
                 session_id=args.session_id,
@@ -319,7 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             session_runtime.close()
 
-    if args.prompt is not None:
+    if args.prompt is not None:  #当用户 传入了位置参数 prompt （即 python scripts/cli.py "提问内容" ）时走这条路径
         try:
             session_runtime = build_cli_session_runtime(
                 session_id=args.session_id,
@@ -354,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             session_runtime.close()
 
-    return run_repl(
+    return run_repl(  #运行交互式 REPL，处理用户输入并渲染模型回复
         config,
         session_id=args.session_id,
         new_session=args.new_session,

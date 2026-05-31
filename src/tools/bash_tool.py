@@ -361,13 +361,13 @@ def run_bash(
             directory_resolved=workspace_directory.relative_posix,
         )
 
-    stdout = _normalize_output(completed.stdout)
-    stderr = _normalize_output(completed.stderr)
+    stdout = _normalize_output(completed.stdout)  #统一转换为字符串格式
+    stderr = _normalize_output(completed.stderr)  #统一转换为字符串格式
     stats = build_stats(
         start_time,
         stdout_bytes=len(stdout.encode("utf-8")),
         stderr_bytes=len(stderr.encode("utf-8")),
-    )
+    )  # 统计 stdout 和 stderr 的字节数
     data = {
         "stdout": stdout,
         "stderr": stderr,
@@ -390,7 +390,7 @@ def run_bash(
         text=text,
         runtime_context=runtime_context,
         workspace_root=workspace_directory.resolved,
-    )
+    )  #输出截断处理
     response_builder = (
         success_response
         if completed.returncode == 0 and not output_truncated

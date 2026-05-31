@@ -85,6 +85,7 @@ def _normalize_usage(usage: Any) -> dict[str, int] | None:
 
 
 def extract_usage_from_raw_event_data(raw_event_data: Any) -> dict[str, int] | None:
+    """从原始事件数据中提取 token 使用信息。"""
     # 第三方 provider 可能只在完成事件里带 usage，所以这里统一做一次鸭子类型提取。
     response = getattr(raw_event_data, "response", None)
     usage = getattr(response, "usage", None) if response is not None else None
@@ -101,6 +102,7 @@ def _sanitize_string(value: str) -> str:
 
 
 def sanitize_trace_payload(value: Any) -> Any:
+    """自动脱敏 trace payload 中的敏感信息，如 API 密钥、Bearer 令牌等。"""
     if isinstance(value, str):
         return _sanitize_string(value)
     if isinstance(value, list):
@@ -114,6 +116,9 @@ def sanitize_trace_payload(value: Any) -> Any:
 
 
 class LocalTraceLogger:
+    """把所有运行时事件写入两种格式：
+    - JSONL trace-{session_id}.jsonl ，每行一个 JSON 事件
+    - HTML trace-{session_id}.html ，可交互的审计页面"""
     def __init__(self, *, session_id: str, config: TraceConfig | None = None) -> None:
         self._config = config or load_trace_config()
         self._session_id = session_id
