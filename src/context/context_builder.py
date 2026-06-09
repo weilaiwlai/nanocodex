@@ -176,9 +176,11 @@ TOOL_RULE_GROUPS = [
     },
     {
         "name": "Skills And Team Coordination",
-        "tools": ["Skill", "SpawnTeammate", "ListTeammates", "SendMessage", "ShutdownRequest", "PlanApproval"],
+        "tools": ["Skill", "CreateSkill", "DownloadSkill", "SpawnTeammate", "ListTeammates", "SendMessage", "ShutdownRequest", "PlanApproval"],
         "guidance": [
             "- Use Skill only when the user explicitly mentions a skill or the task clearly matches that skill's stable instructions.",
+            "- Use CreateSkill when the user asks to define a new reusable skill for the workspace.",
+            "- Use DownloadSkill when the user provides a URL to an external skill file and asks to install it.",
             "- Use ListTeammates before creating teammates or assigning more work, so you do not duplicate active workers.",
             "- Use SpawnTeammate for long-lived collaboration inside the current session team.",
             "- Use SendMessage for short explicit coordination messages rather than vague conversational handoffs.",
@@ -186,6 +188,7 @@ TOOL_RULE_GROUPS = [
         ],
         "risks": [
             "- Do not load Skill by default on every turn.",
+            "- Do not overwrite an existing skill with CreateSkill or DownloadSkill; if the skill already exists, suggest using Write to update it instead.",
             "- Do not create a teammate with an existing role before checking ListTeammates.",
             "- Do not use ordinary messages when a defined team protocol already exists.",
         ],
