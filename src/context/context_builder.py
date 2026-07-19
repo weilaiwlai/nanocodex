@@ -209,6 +209,11 @@ class RepoRuleLayer:
     rules: tuple[tuple[str, str], ...]  # (name, content) 对
     available: bool
 
+    @property
+    def content(self) -> str:
+        """拼接所有规则内容为单一字符串"""
+        return "\n\n".join(content for _, content in self.rules)
+
 
 @dataclass(frozen=True, slots=True)
 class LongTermMemoryLayer:
