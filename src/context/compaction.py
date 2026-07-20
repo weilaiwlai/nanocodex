@@ -84,6 +84,8 @@ class HistorySummary:
 
 class _HistorySummaryOutput(BaseModel):
     # 结构化输出字段：核心 4 字段 + 扩展 3 字段。
+    # 注：部分第三方兼容接口（如 DeepSeek）暂不支持 output_type 结构化输出，
+    # generate_history_summary 中已改用普通文本输出并手动解析 JSON，此处保留原模型供参考。
     current_goal: str = Field(default="")
     key_constraints_and_decisions: list[str] = Field(default_factory=list)
     important_files_and_evidence: list[str] = Field(default_factory=list)
@@ -91,6 +93,53 @@ class _HistorySummaryOutput(BaseModel):
     active_topics: list[str] = Field(default_factory=list)
     errors_encountered: list[str] = Field(default_factory=list)
     decisions_rationale: list[str] = Field(default_factory=list)
+
+
+# DeepSeek 等兼容接口不支持 output_type 结构化输出，这里提供一份可解析的 JSON 模板。
+_HISTORY_SUMMARY_JSON_TEMPLATE = """{
+    "current_goal": "简短描述当前用户目标",
+    "key_constraints_and_decisions": ["约束或决策 1", "约束或决策 2"],
+    "important_files_and_evidence": ["文件或证据 1", "文件或证据 2"],
+    "unfinished_items": ["未完成的项 1", "未完成的项 2"],
+    "active_topics": ["活跃主题 1"],
+    "errors_encountered": ["遇到的错误 1"],
+    "decisions_rationale": ["决策理由 1"]
+}"""
+
+
+def _parse_summary_json(raw_output: str) -> _HistorySummaryOutput:
+    """从普通文本输出中提取 JSON，兼容 markdown 代码块包裹。"""
+    # 优先取 markdown 代码块中的 JSON
+    text = raw_output.strip()
+    if text.startswith("```"):
+        # 去除开头的 ```json 或 ```
+        lines = text.splitlines()
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    # 尝试直接解析 JSON
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # 兜底：尝试取第一个 { 与最后一个 } 之间的内容
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError(f"summary output is not valid JSON: {raw_output[:200]}") from exc
+        data = json.loads(text[start : end + 1])
+
+    return _HistorySummaryOutput(
+        current_goal=data.get("current_goal", ""),
+        key_constraints_and_decisions=data.get("key_constraints_and_decisions", []),
+        important_files_and_evidence=data.get("important_files_and_evidence", []),
+        unfinished_items=data.get("unfinished_items", []),
+        active_topics=data.get("active_topics", []),
+        errors_encountered=data.get("errors_encountered", []),
+        decisions_rationale=data.get("decisions_rationale", []),
+    )
 
 
 SummaryGenerator = Callable[[list[TResponseInputItem], str], Awaitable[HistorySummary]]
@@ -355,13 +404,41 @@ async def generate_history_summary(
     model: str,
 ) -> HistorySummary:
     # summary 生成和主 agent 分开跑，避免把压缩提示词污染正常 coding 提示词。
+    # 原实现使用 output_type 结构化输出，部分第三方兼容接口（如 DeepSeek）不支持该
+    # response_format 类型，会报错 "This response_format type is unavailable now"。
+    # 因此改为普通文本输出，让模型返回 JSON，再手动解析。
+    #
+    # 原代码（已注释）：
+    # summary_agent = Agent(
+    #     name="history-summary",
+    #     model=model,
+    #     output_type=_HistorySummaryOutput,
+    #     instructions=(
+    #         "You summarize long coding-agent conversations.\n"
+    #         "Return only structured fields.\n"
+    #         "Keep the current user goal, key constraints or decisions, important files or evidence, "
+    #         "and unfinished items.\n"
+    #         "Prefer short bullet-like phrases."
+    #     ),
+    # )
+    # result = await Runner.run(
+    #     summary_agent,
+    #     input=(
+    #         "Summarize the following session history.\n\n"
+    #         f"{_render_history_for_summary(history_items)}"
+    #     ),
+    # )
+    # summary_output = result.final_output
+    # if not isinstance(summary_output, _HistorySummaryOutput):
+    #     raise TypeError("summary generator returned an unexpected output type")
+
     summary_agent = Agent(
         name="history-summary",
         model=model,
-        output_type=_HistorySummaryOutput,
         instructions=(
             "You summarize long coding-agent conversations.\n"
-            "Return only structured fields.\n"
+            "Return ONLY a valid JSON object matching this structure, with no extra text:\n"
+            f"{_HISTORY_SUMMARY_JSON_TEMPLATE}\n"
             "Keep the current user goal, key constraints or decisions, important files or evidence, "
             "and unfinished items.\n"
             "Prefer short bullet-like phrases."
@@ -374,9 +451,7 @@ async def generate_history_summary(
             f"{_render_history_for_summary(history_items)}"
         ),
     )
-    summary_output = result.final_output
-    if not isinstance(summary_output, _HistorySummaryOutput):
-        raise TypeError("summary generator returned an unexpected output type")
+    summary_output = _parse_summary_json(str(result.final_output))
 
     return HistorySummary(
         layer="L3",
