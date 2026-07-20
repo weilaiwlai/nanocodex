@@ -71,7 +71,6 @@ lerna-debug.log*
 .nyc_output/
 
 # Documentation
-/docs/
 /site/
 
 # Local development
