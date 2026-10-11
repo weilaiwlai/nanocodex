@@ -7,7 +7,7 @@ from src.runtime.session import ToolRuntimeContext
 from src.tasks.background import start_background_command
 from src.tasks.subagent import run_subagent_task
 from src.tasks.task_graph import update_task
-from src.tasks.task_store import create_task, get_task, list_tasks
+from src.tasks.task_store import TaskConflict, create_task, get_task, list_tasks
 from src.tools.common import (
     ToolFailure,
     build_context,
@@ -117,6 +117,8 @@ def task_update(
             result_summary=result_summary,
             result_artifact=result_artifact,
             error=error,
+            expected_owner_agent_id=(active_runtime_context.owner_agent_id if active_runtime_context.active_task_id == task_id else None),
+            expected_lease_token=(active_runtime_context.active_lease_token if active_runtime_context.active_task_id == task_id else None),
         )
     except FileNotFoundError as exc:
         failure = ToolFailure(
@@ -131,7 +133,7 @@ def task_update(
             params_input=params_input,
             session_id=session_id,
         )
-    except ValueError as exc:
+    except (ValueError, TaskConflict) as exc:
         failure = ToolFailure(
             code="INVALID_PARAM",
             message=str(exc),
@@ -315,6 +317,7 @@ def background_run(
     *,
     command: str,
     title: str | None = None,
+    timeout_ms: int = 120_000,
     runtime_context: ToolRuntimeContext | None = None,
 ) -> ToolResponse:
     start_time = start_timer()
@@ -328,6 +331,7 @@ def background_run(
             runtime_context=active_runtime_context,
             command=command,
             title=title,
+            timeout_ms=timeout_ms,
         )
         return success_response(
             data=result,
@@ -338,6 +342,9 @@ def background_run(
                 session_id=active_runtime_context.session_id,
             ),
         )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return error_from_failure(ToolFailure(code='EXECUTION_ERROR', message=str(exc), text=str(exc)),
+                                  start_time=start_time, params_input=params_input)
     except ToolFailure as failure:
         session_id = runtime_context.session_id if runtime_context is not None else "detached-session"
         return error_from_failure(
@@ -472,22 +479,26 @@ async def _task_run_tool(
     )
 
 
-def _background_run_tool(
+async def _background_run_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     command: str,
     title: str | None = None,
+    timeout_ms: int = 120_000,
 ) -> ToolResponse:
     params_input = {
         "command": command,
         "title": title,
     }
-    return run_traced_tool(
+    from src.tools.common import run_traced_tool_async
+    from src.runtime.async_utils import async_call
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="BackgroundRun",
         params_input=params_input,
-        invoke=lambda: background_run(
+        invoke=lambda: async_call(background_run,
             command=command,
             title=title,
+            timeout_ms=timeout_ms,
             runtime_context=ctx.context,
         ),
     )

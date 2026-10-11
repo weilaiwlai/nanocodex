@@ -1,5 +1,7 @@
 # nanocodex
 
+运行时权限、长命令取消、任务事务、上下文预算及评测说明：[运行时补强说明](docs/runtime_upgrade.md)。
+
 nanocodex 是一个面向**本地代码仓库**的智能编程助手，基于 OpenAI Agents SDK 构建。与云端 Code Agent 不同，nanocodex 深度整合本地环境，具备 workspace 级长期记忆和精细化的上下文治理能力，让 AI 能够真正理解你的代码库，成为你日常开发中的可靠搭档。
 
 ## 核心亮点

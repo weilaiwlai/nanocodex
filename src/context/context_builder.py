@@ -134,12 +134,16 @@ TOOL_RULE_GROUPS = [
     },
     {
         "name": "Editing And Local Execution",
-        "tools": ["Edit", "Write", "TodoWrite", "Bash", "Compact"],
+        "tools": ["Edit", "Write", "TodoWrite", "Bash", "Compact", "RequestPermissions", "CommandPoll", "CommandCancel"],
         "guidance": [
             "- Use Edit to replace one unique snippet in an existing text file after reading that file.",
             "- Use Write to create a new text file or fully overwrite an existing one when full replacement is intended.",
             "- Use TodoWrite to maintain the short active plan; keep at most one in_progress item.",
             "- Use Bash only for non-interactive local commands such as tests, build, lint, or formatter runs.",
+            "- Commands run in an OS sandbox with network denied by default. Use RequestPermissions to ask the user for extra paths or network access.",
+            "- Respect denied permissions. Never change command spelling or switch to BackgroundRun to bypass policy.",
+            "- Use CommandPoll with the returned process_id and cursor for progress; use CommandCancel to stop a command.",
+            "- Long commands have a finite timeout; use BackgroundRun for work that should return a process_id immediately.",
             "- Use Compact only when older history should be compressed into summary rather than carried verbatim.",
         ],
         "risks": [
@@ -352,14 +356,20 @@ def build_stable_context_layer(
     )
 
 
-def build_repo_rule_layer(*, workspace_root: Path | None = None) -> RepoRuleLayer:
+def build_repo_rule_layer(*, workspace_root: Path | None = None, runtime_context=None) -> RepoRuleLayer:
     root = (workspace_root or get_default_workspace_root()).resolve()
+    from src.runtime.permissions import ExecutionPolicy, PermissionBroker, PermissionDenied
+    policy = runtime_context.execution_policy() if runtime_context is not None else ExecutionPolicy(root, PermissionBroker())
     rules_dir = root / REPO_RULES_DIR / REPO_RULES_SUBDIR
     rules: list[tuple[str, str]] = []
 
     # 优先读取 .nanocodex/rules/ 目录下的所有 .md 文件。
     if rules_dir.is_dir():
         for md_file in sorted(rules_dir.glob("*.md")):
+            try:
+                policy.authorize_path(md_file)
+            except PermissionDenied:
+                continue
             content = md_file.read_text(encoding="utf-8").strip()
             if content:
                 rules.append((md_file.stem, content))
@@ -367,6 +377,10 @@ def build_repo_rule_layer(*, workspace_root: Path | None = None) -> RepoRuleLaye
     # 后备：如果没有 rules 目录或目录为空，回退到读取 code_law.md。
     if not rules:
         legacy_path = root / CODE_LAW_FILENAME
+        try:
+            policy.authorize_path(legacy_path)
+        except PermissionDenied:
+            return RepoRuleLayer(rules=(), available=False)
         if legacy_path.exists():
             content = legacy_path.read_text(encoding="utf-8").strip()
             if content:
@@ -395,7 +409,7 @@ def build_long_term_memory_layer(*, workspace_root: Path | None = None) -> LongT
     # memory dir 绑定 workspace identity，而不是 execution_root；这样 worktree 切换不会拆散长期记忆。
     memory_dir = get_workspace_memory_dir(workspace_root=workspace_root)
     index_path = get_workspace_memory_index_path(workspace_root=workspace_root)
-    if not index_path.exists():
+    if not index_path.exists() or not index_path.resolve().is_relative_to(memory_dir):
         return LongTermMemoryLayer(
             memory_dir=memory_dir,
             index_path=index_path,
@@ -512,7 +526,8 @@ async def build_context_bundle(
         tool_names,
         skill_loader=skill_loader,
     )  #跨会话不变的内容
-    repo_rule_layer = build_repo_rule_layer(workspace_root=active_workspace_root)  #仓库本地规则
+    repo_rule_layer = build_repo_rule_layer(workspace_root=active_execution_root,
+                                           runtime_context=session_runtime.context if session_runtime is not None else None)
     long_term_memory_layer = build_long_term_memory_layer(workspace_root=active_workspace_root) #跨会话的长期记忆
     preprocessed_input = preprocess_user_input(
         user_input,
@@ -536,7 +551,7 @@ async def build_context_bundle(
     if session_runtime is not None:
         # 先注入 teammate 发给 lead 的消息，再注入 background 结果。
         # 两者都属于“上一轮之外发生的系统事件”，不直接改写原始 session history。
-        if session_runtime.context.team_runtime is not None:
+        if session_runtime.context.team_runtime is not None and session_runtime.context.actor_name == 'team-lead':
             team_messages = session_runtime.context.team_runtime.drain_lead_messages()
             teammate_state_changes = session_runtime.context.team_runtime.drain_teammate_state_changes()
             if team_messages:

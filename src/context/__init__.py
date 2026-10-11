@@ -1,35 +1,19 @@
-"""上下文构造与分层 helper。"""
+"""Context helpers loaded on demand; storage and budget checks also work offline."""
+from importlib import import_module
 
-from src.context.context_builder import (
-    ContextBundle,
-    LongTermMemoryLayer,
-    RepoRuleLayer,
-    RuntimeContextLayer,
-    StableContextLayer,
-    build_context_bundle,
-    build_long_term_memory_layer,
-    build_repo_rule_layer,
-    build_stable_context_layer,
-)
-from src.context.file_mentions import (
-    FileMentionPreprocessResult,
-    build_file_mention_reminder,
-    extract_file_mentions,
-    preprocess_user_input,
-)
+_BUILDER = {
+    "StableContextLayer", "RepoRuleLayer", "LongTermMemoryLayer", "RuntimeContextLayer",
+    "ContextBundle", "build_stable_context_layer", "build_repo_rule_layer",
+    "build_long_term_memory_layer", "build_context_bundle",
+}
+_MENTIONS = {"FileMentionPreprocessResult", "extract_file_mentions", "build_file_mention_reminder", "preprocess_user_input"}
+__all__ = sorted(_BUILDER | _MENTIONS)
 
-__all__ = [
-    "StableContextLayer",
-    "RepoRuleLayer",
-    "LongTermMemoryLayer",
-    "RuntimeContextLayer",
-    "ContextBundle",
-    "build_stable_context_layer",
-    "build_repo_rule_layer",
-    "build_long_term_memory_layer",
-    "build_context_bundle",
-    "FileMentionPreprocessResult",
-    "extract_file_mentions",
-    "build_file_mention_reminder",
-    "preprocess_user_input",
-]
+
+def __getattr__(name):
+    if name in _BUILDER | _MENTIONS:
+        module = "context_builder" if name in _BUILDER else "file_mentions"
+        value = getattr(import_module(f"src.context.{module}"), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(name)

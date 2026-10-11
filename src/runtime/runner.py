@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+import asyncio
 from uuid import uuid4
 
 from agents import (
@@ -20,6 +21,8 @@ from src.runtime.config import RuntimeConfig
 from src.runtime.events import RuntimeEventBuilder, summarize_tool_call, summarize_tool_result
 from src.runtime.session import CliSessionRuntime
 from src.runtime.tracing import extract_usage_from_raw_event_data
+from src.runtime.streaming import controlled_events, controlled_run, RunCancelled
+from src.context.budget import build_model_input_filter
 from src.tools.registry import AGENT_TOOLS
 
 
@@ -89,12 +92,13 @@ async def run_events(
     usage: dict[str, int] | None = None
     pending_tool_names: list[str] = []
     try:
-        context_bundle = await build_context_bundle(
+        context_task = build_context_bundle(
             user_input=user_input,
             session_runtime=session_runtime,
             tool_names=[tool.name for tool in AGENT_TOOLS],
             model_name=config.model,
-        )  #构建上下文包，包含历史消息、当前轮消息、提及文件等
+        )
+        context_bundle = await controlled_run(context_task, active_context) if active_context is not None else await context_task
         if active_context is not None:
             active_context.log_trace_context_build(
                 {
@@ -130,10 +134,11 @@ async def run_events(
             model=config.model,
             instructions=context_bundle.build_agent_instructions(),
         )  #创建 Agent 实例
-        run_config = None
+        run_config = RunConfig(call_model_input_filter=build_model_input_filter(active_context, config.model))
         if session_runtime is not None:
             # micro_compact 只影响“本轮送给模型的输入视图”，不直接改写底层 session 原文。
             run_config = RunConfig(
+                call_model_input_filter=build_model_input_filter(active_context, config.model),
                 session_input_callback=build_session_input_callback(context_bundle)
             )
         result = Runner.run_streamed(
@@ -145,7 +150,11 @@ async def run_events(
             max_turns=50,
         )  #流式运行 Agent 实例
 
-        async for event in result.stream_events():      #逐个产出结构化事件
+        async for source, event in controlled_events(result, active_context):
+            if source == 'runtime':
+                name, payload = event
+                yield event_builder.build(name, payload)
+                continue
             # 这里严格对齐官方 streaming 示例，避免误判事件层级。
             if (
                 event.type == "raw_response_event"
@@ -179,10 +188,11 @@ async def run_events(
                             "summary": payload["summary"],
                         },
                     )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, RunCancelled, asyncio.CancelledError):
         if result is not None:
             result.cancel()
         if active_context is not None:
+            active_context.cancel_run()
             active_context.log_trace_error(
                 stage="run",
                 message="用户中断了当前运行。",
@@ -196,9 +206,12 @@ async def run_events(
             "run_failed",
             {"status": "cancelled", "message": "用户中断了当前运行。"},
         )
-        raise
+        return
     except Exception as exc:
+        if result is not None:
+            result.cancel()
         if active_context is not None:
+            active_context.cancel_run()
             active_context.log_trace_error(
                 stage="run",
                 message=str(exc),
@@ -219,6 +232,9 @@ async def run_events(
         )
         raise
 
+    from types import SimpleNamespace
+    aggregate_usage = getattr(getattr(result, 'context_wrapper', None), 'usage', None)
+    usage = extract_usage_from_raw_event_data(SimpleNamespace(usage=aggregate_usage)) or usage
     if isinstance(result.final_output, str):
         final_output = result.final_output
     elif result.final_output is None:

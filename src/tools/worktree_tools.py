@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from src.runtime.async_utils import async_call
+
 from agents import RunContextWrapper, function_tool
 
 from src.protocol import ToolResponse, success_response
@@ -10,7 +12,7 @@ from src.tools.common import (
     build_context,
     build_stats,
     error_from_failure,
-    run_traced_tool,
+    run_traced_tool_async,
     start_timer,
 )
 
@@ -143,40 +145,40 @@ def _worktree_closeout(
         )
 
 
-def _worktree_create_tool(
+async def _worktree_create_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     task_id: int,
 ) -> ToolResponse:
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="WorktreeCreate",
         params_input={"task_id": task_id},
-        invoke=lambda: _worktree_create(
+        invoke=lambda: async_call(_worktree_create,
             task_id=task_id,
             runtime_context=ctx.context,
         ),
     )
 
 
-def _worktree_list_tool(ctx: RunContextWrapper[ToolRuntimeContext]) -> ToolResponse:
-    return run_traced_tool(
+async def _worktree_list_tool(ctx: RunContextWrapper[ToolRuntimeContext]) -> ToolResponse:
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="WorktreeList",
         params_input={},
-        invoke=lambda: _worktree_list(runtime_context=ctx.context),
+        invoke=lambda: async_call(_worktree_list,runtime_context=ctx.context),
     )
 
 
-def _worktree_closeout_tool(
+async def _worktree_closeout_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     task_id: int,
     action: str,
 ) -> ToolResponse:
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="WorktreeCloseout",
         params_input={"task_id": task_id, "action": action},
-        invoke=lambda: _worktree_closeout(
+        invoke=lambda: async_call(_worktree_closeout,
             task_id=task_id,
             action=action,
             runtime_context=ctx.context,

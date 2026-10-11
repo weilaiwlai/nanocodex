@@ -221,6 +221,8 @@ def resolve_workspace_path(
     *,
     workspace_root: Path | None = None,
     allow_roots: tuple[Path, ...] = (),
+    runtime_context: Any = None,
+    operation: str = "read",
 ) -> WorkspacePath:
     raw_path = path or "."
     active_root = (workspace_root or get_default_workspace_root()).resolve()
@@ -230,6 +232,20 @@ def resolve_workspace_path(
 
     # 统一在这里做一次真实路径归一化和边界校验，避免每个工具各写一套。
     resolved = candidate.resolve(strict=False)
+    if runtime_context is None:
+        from src.runtime.permissions import ExecutionPolicy, PermissionBroker, PermissionDenied
+        try:
+            ExecutionPolicy(active_root, PermissionBroker(), allow_roots).authorize_path(resolved, write=operation == 'write')
+        except PermissionDenied as exc:
+            raise ToolFailure(code='ACCESS_DENIED', message=str(exc), text=str(exc)) from exc
+    if runtime_context is not None:
+        from src.runtime.permissions import PermissionDenied
+        try:
+            runtime_context.execution_policy(allow_roots).authorize_path(resolved, write=operation == 'write')
+        except PermissionDenied as exc:
+            raise ToolFailure(code='ACCESS_DENIED', message=str(exc), text=str(exc)) from exc
+        approved_reads, approved_writes, _ = runtime_context.permission_broker.snapshot()
+        allow_roots = (*allow_roots, *(approved_writes if operation == 'write' else approved_reads))
     matched_root = _match_allowed_root(
         resolved,
         roots=(active_root, *allow_roots),
@@ -400,6 +416,8 @@ def maybe_truncate_output_text(
     )
     output_path = output_dir / filename
     output_path.write_text(full_output, encoding="utf-8")
+    if runtime_context is not None:
+        runtime_context.permission_broker.grant(read_paths=[output_path])
 
     return OutputTruncation(
         max_lines=limits.max_lines,

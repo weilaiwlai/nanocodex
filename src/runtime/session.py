@@ -10,13 +10,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from agents import SQLiteSession
+from src.runtime.history import AtomicSQLiteSession as SQLiteSession
+from src.runtime.execution import CommandManager
+from src.runtime.permissions import ExecutionPolicy, PermissionBroker
+from src.runtime.persistence import write_json_atomic
 
-from src.context.compaction import HistorySummary
 from src.runtime.paths import AGENT_CODE_ROOT, get_default_workspace_root
 from src.runtime.tracing import LocalTraceLogger, build_trace_logger
 
 if TYPE_CHECKING:
+    from src.context.compaction import HistorySummary
     from src.tasks.agent_team import AgentTeamRuntime
 
 DEFAULT_SESSION_ROOT = AGENT_CODE_ROOT / "artifacts" / "sessions"
@@ -137,6 +140,40 @@ class ToolRuntimeContext:
     active_trace_run_id: str | None = None
     background_notifications: list[dict[str, object]] = field(default_factory=list)
     background_notification_lock: threading.Lock = field(default_factory=threading.Lock)
+    permission_broker: PermissionBroker = field(default_factory=PermissionBroker)
+    command_manager: CommandManager = field(default_factory=CommandManager)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    runtime_events: list[tuple[str, dict]] = field(default_factory=list)
+    runtime_event_lock: threading.Lock = field(default_factory=threading.Lock)
+    active_task_id: int | None = None
+    active_lease_token: str | None = None
+    owner_agent_id: str | None = None
+
+    def __post_init__(self):
+        if self.permission_broker.emit is None:
+            self.permission_broker.emit = self.emit_runtime_event
+
+    def execution_policy(self, memory_roots=()) -> ExecutionPolicy:
+        return ExecutionPolicy(self.execution_root, self.permission_broker, tuple(memory_roots), (self.session_dir,))
+
+    def emit_runtime_event(self, event_type: str, payload: dict) -> None:
+        with self.runtime_event_lock:
+            # Command output is also persisted to disk; keep the UI outbox bounded.
+            if len(self.runtime_events) >= 512:
+                index = next((i for i, event in enumerate(self.runtime_events) if event[0] == 'command_output'), None)
+                if index is not None:
+                    self.runtime_events.pop(index)
+            self.runtime_events.append((event_type, payload))
+
+    def drain_runtime_events(self):
+        with self.runtime_event_lock:
+            events = list(self.runtime_events)
+            self.runtime_events.clear()
+        return events
+
+    def cancel_run(self):
+        self.cancel_event.set()
+        self.command_manager.cancel_owner(self.actor_name)
 
     def remember_read_snapshot(
         self,
@@ -333,8 +370,10 @@ class CliSessionRuntime:
         _save_session_meta(self.meta_path, self.meta)
 
     def close(self) -> None:
+        self.context.cancel_run()
         if self.context.team_runtime is not None:
             self.context.team_runtime.close()
+        self.context.command_manager.close()
         self.context.close_trace_session()
         self.session.close()
 
@@ -363,19 +402,11 @@ def _load_session_meta(meta_path: Path, *, session_id: str) -> SessionMeta:
 
 
 def _save_session_meta(meta_path: Path, meta: SessionMeta) -> None:
-    meta_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path.write_text(
-        json.dumps(meta.as_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json_atomic(meta_path, meta.as_dict())
 
 
 def _write_current_session_pointer(pointer_path: Path, session_id: str) -> None:
-    pointer_path.parent.mkdir(parents=True, exist_ok=True)
-    pointer_path.write_text(
-        json.dumps({"session_id": session_id}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json_atomic(pointer_path, {"session_id": session_id})
 
 
 def _read_current_session_pointer(pointer_path: Path) -> str | None:

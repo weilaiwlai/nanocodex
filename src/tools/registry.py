@@ -1,6 +1,7 @@
 """集中导出主代理会挂载的工具清单。"""
 
 from src.tools.bash_tool import BASH_TOOLS
+from src.tools.execution_tools import EXECUTION_TOOLS
 from src.tools.compaction_tool import COMPACTION_TOOLS
 from src.tools.edit_write import FILE_EDIT_TOOLS
 from src.tools.read_only import READ_ONLY_TOOLS
@@ -15,6 +16,7 @@ AGENT_TOOLS = [
     *FILE_EDIT_TOOLS,
     *TODO_TOOLS,
     *BASH_TOOLS,
+    *EXECUTION_TOOLS,
     *COMPACTION_TOOLS,
     *TASK_TOOLS,
     *WORKTREE_TOOLS,

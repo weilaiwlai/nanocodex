@@ -1,7 +1,8 @@
-import React, {useEffect, useMemo, useState} from 'react';
+import React, {useEffect, useMemo, useState, useRef} from 'react';
 import {Box, render, Text, useApp, useInput, useStdout} from 'ink';
 import {spawn} from 'node:child_process';
 import path from 'node:path';
+import {createController, type CommandController} from './control.js';
 import {fileURLToPath} from 'node:url';
 
 // Windows 中文环境下强制 UTF-8，避免边框和中文显示乱码
@@ -78,23 +79,30 @@ function runPythonCli(
 	handlers: {
 		onStdoutLine?: (line: string) => void;
 		onStderrLine?: (line: string) => void;
+		onControl?: (controller: CommandController) => void;
 	},
 ): Promise<void> {
 	// Python CLI 仍然是真正的执行端；Ink 只负责把 JSONL 事件转成状态。
 	// 支持 NANOCODOX_TUI_PYTHON 环境变量指定 python 路径（如 conda 环境）。
 	// 例：NANOCODOX_TUI_PYTHON="C:\envs\nanocodex\python.exe"
 	return new Promise((resolve, reject) => {
-		const pythonOverride = process.env.NANOCODOX_TUI_PYTHON;
+		const pythonOverride = process.env.NANOCODEX_TUI_PYTHON ?? process.env.NANOCODOX_TUI_PYTHON;
 		const isWindows = process.platform === 'win32';
 		const child = pythonOverride
 			? spawn(pythonOverride, [path.join(REPO_ROOT, 'scripts/cli.py'), ...args], {
 				cwd: REPO_ROOT,
+				detached: process.platform !== 'win32',
 				env: isWindows ? {...process.env, PYTHONIOENCODING: 'utf-8'} : process.env,
 			})
 			: spawn('uv', ['run', 'python', path.join(REPO_ROOT, 'scripts/cli.py'), ...args], {
 				cwd: REPO_ROOT,
+				detached: process.platform !== 'win32',
 				env: isWindows ? {...process.env, PYTHONIOENCODING: 'utf-8'} : process.env,
 			});
+		const controller = createController(child);
+		handlers.onControl?.(controller);
+		child.stdin.on('error', () => {});
+		child.on('close', controller.dispose);
 		let stdoutBuffer = '';
 		let stderrBuffer = '';
 
@@ -143,7 +151,7 @@ function runPythonCli(
 	});
 }
 
-async function bootstrapSession(args: {workspaceRoot?: string; sessionId?: string}): Promise<SessionDescriptor> {
+async function bootstrapSession(args: {workspaceRoot?: string; sessionId?: string}, onControl?: (controller: CommandController) => void): Promise<SessionDescriptor> {
 	// 会话初始化单独走一次 CLI，避免 TUI 自己生成 session id。
 	const cliArgs = ['--print-session-json'];
 	if (args.sessionId) {
@@ -157,6 +165,7 @@ async function bootstrapSession(args: {workspaceRoot?: string; sessionId?: strin
 
 	let descriptor: SessionDescriptor | null = null;
 	await runPythonCli(cliArgs, {
+		onControl,
 		onStdoutLine: line => {
 			descriptor = JSON.parse(line) as SessionDescriptor;
 		},
@@ -173,10 +182,12 @@ async function streamPrompt(
 	handlers: {
 		onEvent: (event: RuntimeEvent) => void;
 		onError: (message: string) => void;
+		onControl: (controller: CommandController) => void;
 	},
 ): Promise<void> {
 	// 每轮 prompt 都复用同一个 session id，这样 TUI 虽是多次进程调用，状态仍然连续。
-	await runPythonCli(['--session', sessionId, '--json-events', prompt], {
+	await runPythonCli(['--session', sessionId, '--json-events', '--control-stdin', prompt], {
+		onControl: handlers.onControl,
 		onStdoutLine: line => {
 			handlers.onEvent(JSON.parse(line) as RuntimeEvent);
 		},
@@ -189,6 +200,10 @@ async function streamPrompt(
 function summarizeEvent(event: RuntimeEvent): string | null {
 	// 右侧活动面板默认只展示摘要，不直接把大段 tool_result 或正文塞进去。
 	const payload = event.payload ?? {};
+	if (event.type === 'command_output') return String(payload.text ?? '');
+	if (event.type === 'command_started') return `▶ ${String(payload.command ?? '')}`;
+	if (event.type === 'command_finished') return `命令 ${String(payload.status ?? '')} (exit ${String(payload.exit_code ?? '')})`;
+	if (event.type === 'context_compacted') return '上下文已压缩';
 	if (event.type === 'tool_started') {
 		return `▶ ${String(payload.tool_name ?? 'unknown_tool')}`;
 	}
@@ -532,7 +547,7 @@ function Footer(): React.ReactElement {
 	return (
 		<Box marginTop={1}>
 			<Text dimColor>
-				Enter 发送 · Esc+Enter 换行 · PgUp/PgDn 滚动 · /quit 或 Ctrl+C 退出
+				Enter 发送/运行时提交后续请求 · 运行时 Esc/Ctrl+C 取消 · 空闲时 Esc+Enter 换行 · /quit 退出
 			</Text>
 		</Box>
 	);
@@ -547,6 +562,10 @@ function App(): React.ReactElement {
 	const [timeline, setTimeline] = useState<TimelineItem[]>([]);
 	const [status, setStatus] = useState('正在初始化 session...');
 	const [busy, setBusy] = useState(false);
+	const busyRef = useRef(false);
+	const controllerRef = useRef<CommandController | null>(null);
+	const queuedPrompt = useRef<string | null>(null);
+	const [permissions, setPermissions] = useState<Record<string, unknown>[]>([]);
 	const [errorText, setErrorText] = useState<string | null>(null);
 	const [scrollOffset, setScrollOffset] = useState(0);
 
@@ -568,13 +587,25 @@ function App(): React.ReactElement {
 			return;
 		}
 
-		if (busy) {
+		if (busy && (key.escape || (key.ctrl && inputChunk === 'c'))) {
+			queuedPrompt.current = null;
+			controllerRef.current?.cancel();
+			setStatus('正在取消...');
+			return;
+		}
+		if (permissions.length > 0) {
+			if (inputChunk.toLowerCase() === 'y' || inputChunk.toLowerCase() === 'n') {
+				controllerRef.current?.send({type: 'permission_response',
+					request_id: permissions[0]?.request_id, approved: inputChunk.toLowerCase() === 'y'});
+				setPermissions(previous => previous.slice(1));
+			}
 			return;
 		}
 
 		// 输入编辑规则统一收口到独立模型里，组件层只负责消费结果。
 		const action = applyInputKey(inputState, {inputChunk, key});
 		if (action.kind === 'exit') {
+			controllerRef.current?.cancel();
 			exit();
 			return;
 		}
@@ -596,7 +627,7 @@ function App(): React.ReactElement {
 	useEffect(() => {
 		// TUI 启动时先拿到 session 元信息，后续每轮 prompt 都复用它。
 		let cancelled = false;
-		void bootstrapSession(startupArgs)
+		void bootstrapSession(startupArgs, controller => { controllerRef.current = controller; })
 			.then(descriptor => {
 				if (cancelled) {
 					return;
@@ -613,6 +644,7 @@ function App(): React.ReactElement {
 			});
 		return () => {
 			cancelled = true;
+			controllerRef.current?.cancel();
 		};
 	}, [startupArgs]);
 
@@ -628,10 +660,11 @@ function App(): React.ReactElement {
 	const submitPrompt = async (prompt: string): Promise<void> => {
 		// prompt 一提交就先清空输入框，再把 user turn 立即放进对话区。
 		// 这样用户看到的是正常聊天流，而不是“输入框里还残留上一轮内容”。
-		if (!session || busy) {
+		if (!session) {
 			return;
 		}
 		if (prompt.trim() === '/quit') {
+			controllerRef.current?.cancel();
 			exit();
 			return;
 		}
@@ -639,6 +672,13 @@ function App(): React.ReactElement {
 			return;
 		}
 
+		if (busyRef.current) {
+			queuedPrompt.current = prompt;
+			controllerRef.current?.cancel();
+			setStatus('正在取消，随后执行后续请求...');
+			return;
+		}
+		busyRef.current = true;
 		setBusy(true);
 		setErrorText(null);
 		setStatus('正在运行...');
@@ -648,7 +688,16 @@ function App(): React.ReactElement {
 
 		try {
 			await streamPrompt(session.session_id, prompt, {
+				onControl: controller => { controllerRef.current = controller; },
 				onEvent: event => {
+					if (event.type === 'permission_requested') {
+						setPermissions(previous => [...previous, event.payload ?? {}]);
+						return;
+					}
+					if (event.type === 'permission_resolved') {
+						setPermissions(previous => previous.filter(item => item.request_id !== event.payload?.request_id));
+						return;
+					}
 					if (event.type === 'assistant_text_delta') {
 						const delta = String(event.payload?.delta ?? '');
 						if (!delta) {
@@ -695,7 +744,13 @@ function App(): React.ReactElement {
 			setErrorText(message);
 			setStatus('运行失败');
 		} finally {
+			busyRef.current = false;
+			controllerRef.current = null;
+			setPermissions([]);
 			setBusy(false);
+			const next = queuedPrompt.current;
+			queuedPrompt.current = null;
+			if (next) void submitPrompt(next);
 		}
 	};
 
@@ -719,6 +774,13 @@ function App(): React.ReactElement {
 					<Text color={THEME.warning}>✶ {status}</Text>
 				</Box>
 			) : null}
+			{permissions[0] ? (
+				<Box flexDirection="column">
+					<Text color={THEME.warning}>权限申请: {String(permissions[0].reason ?? '')}</Text>
+					<Text>读取: {JSON.stringify(permissions[0].read_paths)} · 写入: {JSON.stringify(permissions[0].write_paths)} · 联网: {String(permissions[0].network)}</Text>
+					<Text>Y 批准 · N 拒绝 · Esc 取消运行</Text>
+				</Box>
+			) : null}
 			<Separator />
 			<InputArea inputState={inputState} busy={busy} />
 			<Footer />
@@ -730,4 +792,4 @@ export default App;
 
 // Ink 程序必须显式调用 render() 才会真正进入交互循环。
 // 这里只保留一个最小入口，不在启动层额外做复杂参数分发。
-render(<App />);
+if (process.argv[1] && path.resolve(process.argv[1]) === __filename) render(<App />, {exitOnCtrlC: false});

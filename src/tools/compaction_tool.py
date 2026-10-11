@@ -7,6 +7,7 @@ from dataclasses import replace
 from src.context.compaction import compact_session_history, get_context_compaction_config
 from src.protocol import ToolResponse, success_response
 from src.runtime.session import ToolRuntimeContext
+from src.runtime.history import HistoryConflict
 from src.tools.common import (
     ToolFailure,
     build_context,
@@ -90,6 +91,9 @@ async def compact_history(runtime_context: ToolRuntimeContext | None = None) -> 
                 session_id=active_runtime_context.session_id,
             ),
         )
+    except HistoryConflict as exc:
+        return error_from_failure(ToolFailure(code='HISTORY_CONFLICT', message=str(exc), text=str(exc)),
+                                  start_time=start_time, params_input=params_input)
     except ToolFailure as failure:
         return error_from_failure(
             failure,

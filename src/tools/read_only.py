@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from src.runtime.async_utils import async_call
+
 import os
 import re
 import shutil
-import subprocess
+import shlex
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -26,7 +28,7 @@ from src.tools.common import (
     normalize_posix,
     read_workspace_text_file,
     resolve_workspace_path,
-    run_traced_tool,
+    run_traced_tool_async,
     should_skip_entry,
     sort_key_for_entry,
     start_timer,
@@ -72,12 +74,23 @@ def _glob_matches(relative_path: str, pattern: str) -> bool:
     )
 
 
+def _can_read(path, workspace_root, runtime_context=None):
+    from src.runtime.permissions import ExecutionPolicy, PermissionBroker, PermissionDenied
+    policy = runtime_context.execution_policy(_memory_allow_roots(runtime_context)) if runtime_context is not None else ExecutionPolicy(workspace_root, PermissionBroker())
+    try:
+        policy.authorize_path(path)
+        return True
+    except PermissionDenied:
+        return False
+
+
 def _iter_workspace_files(
     search_root: Path,
     *,
     workspace_root: Path,
     include_hidden: bool,
     include_ignored: bool,
+    runtime_context=None,
 ) -> list[Path]:
     files: list[Path] = []
     for current_root, dir_names, file_names in os.walk(search_root):
@@ -87,7 +100,7 @@ def _iter_workspace_files(
             [
                 name
                 for name in dir_names
-                if not should_skip_entry(
+                if _can_read(root_path / name, workspace_root, runtime_context) and not should_skip_entry(
                     relative_posix=normalize_posix(root_path / name, workspace_root=workspace_root),
                     include_hidden=include_hidden,
                     include_ignored=include_ignored,
@@ -98,6 +111,8 @@ def _iter_workspace_files(
 
         for file_name in sorted(file_names, key=str.casefold):
             file_path = root_path / file_name
+            if not _can_read(file_path, workspace_root, runtime_context):
+                continue
             if should_skip_entry(
                 relative_posix=normalize_posix(file_path, workspace_root=workspace_root),
                 include_hidden=include_hidden,
@@ -128,6 +143,7 @@ def _grep_with_rg(
     include: str | None,
     case_sensitive: bool,
     workspace_root: Path,
+    runtime_context=None,
 ) -> list[dict[str, Any]]:
     # 优先走 rg，让“按内容找证据”保持足够快；这里只负责执行和解析，不做协议封装。
     command = ["rg", "--line-number", "--no-heading", "--color", "never"]
@@ -137,13 +153,13 @@ def _grep_with_rg(
         command.extend(["-g", include])
     command.extend([pattern, path_resolved])
 
-    completed = subprocess.run(
-        command,
-        cwd=workspace_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    active = runtime_context or ToolRuntimeContext(workspace_root=workspace_root, execution_root=workspace_root)
+    session = active.command_manager.start(shlex.join(command), cwd=workspace_root,
+                  policy=active.execution_policy(), output_dir=active.session_dir / "commands",
+                  timeout=30, owner=active.actor_name)
+    result = active.command_manager.wait(session.id, cancelled=active.cancel_event)
+    from types import SimpleNamespace
+    completed = SimpleNamespace(returncode=result["exit_code"], stdout=result["stdout"], stderr=result["stderr"])
     if completed.returncode == 1:
         return []
     if completed.returncode != 0:
@@ -170,6 +186,7 @@ def _grep_with_python(
     include: str | None,
     limit: int,
     workspace_root: Path,
+    runtime_context=None,
 ) -> tuple[list[dict[str, Any]], bool]:
     # Python 路径只做最小回退实现：保证无 rg 时工具仍可用，但性能和覆盖率可能打折。
     matches: list[dict[str, Any]] = []
@@ -180,6 +197,7 @@ def _grep_with_python(
         workspace_root=workspace_root,
         include_hidden=False,
         include_ignored=False,
+        runtime_context=runtime_context,
     ):
         relative_project_path = normalize_posix(file_path, workspace_root=workspace_root)
         relative_search_path = file_path.relative_to(search_root).as_posix()
@@ -191,7 +209,9 @@ def _grep_with_python(
 
         try:
             # fallback 里也跳过明显二进制文件，避免把不可读内容塞进搜索结果。
-            if b"\x00" in file_path.read_bytes()[:8192]:
+            with file_path.open("rb") as file:
+                prefix = file.read(8192)
+            if b"\x00" in prefix:
                 continue
             content = file_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -243,6 +263,7 @@ def list_files(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
         )
         ensure_exists(workspace_path)
 
@@ -257,7 +278,7 @@ def list_files(
             entries = [
                 _make_entry(child, workspace_root=workspace_root)
                 for child in children
-                if not should_skip_entry(
+                if _can_read(child, workspace_root, runtime_context) and not should_skip_entry(
                     relative_posix=normalize_posix(child, workspace_root=workspace_root),
                     include_hidden=include_hidden,
                     include_ignored=False,
@@ -332,6 +353,7 @@ def glob_search(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
         )
         ensure_exists(workspace_path)
         if not workspace_path.resolved.is_dir():
@@ -350,6 +372,7 @@ def glob_search(
             workspace_root=workspace_root,
             include_hidden=include_hidden,
             include_ignored=include_ignored,
+            runtime_context=runtime_context,
         ):
             visited += 1
             # Glob 的 pattern 统一相对搜索根目录，而不是相对项目里任意位置。
@@ -421,6 +444,7 @@ def grep_search(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
         )
         ensure_exists(workspace_path)
         if not workspace_path.resolved.is_dir():
@@ -446,8 +470,9 @@ def grep_search(
                     include=include,
                     case_sensitive=case_sensitive,
                     workspace_root=workspace_root,
+                    runtime_context=runtime_context,
                 )
-            except (OSError, RuntimeError, subprocess.SubprocessError):
+            except (OSError, RuntimeError):
                 # rg 失败时不直接报错，而是降级到 Python 搜索，并用 partial 暴露“结果打折”。
                 fallback_used = True
                 fallback_reason = "rg_failed"
@@ -457,6 +482,7 @@ def grep_search(
                     include=include,
                     limit=limit,
                     workspace_root=workspace_root,
+                    runtime_context=runtime_context,
                 )
         else:
             fallback_used = True
@@ -467,6 +493,7 @@ def grep_search(
                 include=include,
                 limit=limit,
                 workspace_root=workspace_root,
+                runtime_context=runtime_context,
             )
 
         if len(matches) > limit:
@@ -588,6 +615,7 @@ def read_file(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
         )
         ensure_exists(workspace_path)
         if workspace_path.resolved.is_dir():
@@ -693,7 +721,7 @@ def read_file(
         )
 
 
-def _ls_tool(
+async def _ls_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     path: str = ".",
     offset: int = 0,
@@ -708,11 +736,11 @@ def _ls_tool(
         "include_hidden": include_hidden,
         "ignore": ignore,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="LS",
         params_input=params_input,
-        invoke=lambda: list_files(
+        invoke=lambda: async_call(list_files,
             path=path,
             offset=offset,
             limit=limit,
@@ -723,7 +751,7 @@ def _ls_tool(
     )
 
 
-def _glob_tool(
+async def _glob_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     pattern: str,
     path: str = ".",
@@ -738,11 +766,11 @@ def _glob_tool(
         "include_hidden": include_hidden,
         "include_ignored": include_ignored,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="Glob",
         params_input=params_input,
-        invoke=lambda: glob_search(
+        invoke=lambda: async_call(glob_search,
             pattern=pattern,
             path=path,
             limit=limit,
@@ -753,7 +781,7 @@ def _glob_tool(
     )
 
 
-def _grep_tool(
+async def _grep_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     pattern: str,
     path: str = ".",
@@ -768,11 +796,11 @@ def _grep_tool(
         "case_sensitive": case_sensitive,
         "limit": limit,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="Grep",
         params_input=params_input,
-        invoke=lambda: grep_search(
+        invoke=lambda: async_call(grep_search,
             pattern=pattern,
             path=path,
             include=include,
@@ -783,7 +811,7 @@ def _grep_tool(
     )
 
 
-def _read_file_tool(
+async def _read_file_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     path: str,
     start_line: int = 1,
@@ -795,11 +823,11 @@ def _read_file_tool(
         "start_line": start_line,
         "limit": limit,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="Read",
         params_input=params_input,
-        invoke=lambda: read_file(
+        invoke=lambda: async_call(read_file,
             path=path,
             start_line=start_line,
             limit=limit,

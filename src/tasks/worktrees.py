@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-import subprocess
+import shlex
+from types import SimpleNamespace
+from src.runtime.permissions import PermissionDenied
+from src.tasks.task_store import task_transaction
+from src.tasks.task_graph import _check_owner
 from pathlib import Path
 from typing import Any
 
 from src.runtime.session import ToolRuntimeContext
-from src.tasks.task_store import get_task, list_tasks, save_task
+from src.tasks.task_store import get_task, list_tasks
 from src.tools.common import ToolFailure
 
 
@@ -21,21 +25,33 @@ def _task_worktree_path(runtime_context: ToolRuntimeContext, task_id: int) -> Pa
     return _worktrees_dir(runtime_context) / f"task_{task_id}"
 
 
-def _run_git_command(*, args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
-    completed = subprocess.run(
-        args,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise ToolFailure(
-            code="EXECUTION_ERROR",
-            message=completed.stderr.strip() or "git 命令执行失败。",
-            text="执行 git 命令时失败，请检查当前仓库状态。",
-        )
-    return completed
+def _run_git_command(*, args: list[str], cwd: Path, runtime_context: ToolRuntimeContext):
+    policy = runtime_context.execution_policy()
+    try:
+        policy.authorize_path(cwd)
+        if args[1] != "status":
+            policy.authorize_path(runtime_context.workspace_root / ".git", write=True)
+        session = runtime_context.command_manager.start(
+            shlex.join(args), cwd=cwd, policy=policy, output_dir=runtime_context.session_dir / "commands",
+            timeout=60, owner=runtime_context.actor_name, emit=runtime_context.emit_runtime_event)
+        result = runtime_context.command_manager.wait(session.id, cancelled=runtime_context.cancel_event)
+    except (PermissionDenied, OSError, RuntimeError) as exc:
+        raise ToolFailure(code="ACCESS_DENIED", message=str(exc), text=str(exc)) from exc
+    if result["status"] != "completed":
+        raise ToolFailure(code="EXECUTION_ERROR", message=result["stderr"] or result["status"],
+                          text="git 执行失败，请检查权限和仓库状态。")
+    return SimpleNamespace(returncode=result["exit_code"], stdout=result["stdout"], stderr=result["stderr"])
+
+
+def _save_worktree_fields(runtime_context, task):
+    # Heartbeats update the revision while git runs; merge only worktree metadata.
+    with task_transaction(runtime_context.tasks_dir) as store:
+        current = store.get(task["id"])
+        if runtime_context.active_task_id == task["id"]:
+            _check_owner(current, runtime_context.owner_agent_id, runtime_context.active_lease_token)
+        for key in ("worktree_name", "worktree_path", "worktree_branch"):
+            current[key] = task.get(key)
+        return store.put(current)
 
 
 def ensure_task_worktree(
@@ -51,17 +67,23 @@ def ensure_task_worktree(
     if task.get("worktree_path"):
         return task
 
+    try:
+        runtime_context.execution_policy().authorize_path(worktree_path.parent, write=True)
+    except PermissionDenied as exc:
+        raise ToolFailure(code="ACCESS_DENIED", message=str(exc),
+                          text=f"先通过 RequestPermissions 批准写入 {worktree_path.parent} 和仓库 .git。") from exc
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
     # 为每个 task 创建独立分支，方便后续 merge 回主分支。
     _run_git_command(
         args=["git", "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
         cwd=runtime_context.workspace_root,
+        runtime_context=runtime_context,
     )
     resolved_worktree_path = worktree_path.resolve()
     task["worktree_name"] = f"task-{task_id}"
     task["worktree_path"] = str(resolved_worktree_path)
     task["worktree_branch"] = branch_name
-    return save_task(runtime_context.tasks_dir, task)
+    return _save_worktree_fields(runtime_context, task)
 
 
 def list_worktrees(*, runtime_context: ToolRuntimeContext) -> list[dict[str, Any]]:
@@ -84,6 +106,7 @@ def list_worktrees(*, runtime_context: ToolRuntimeContext) -> list[dict[str, Any
                 status = _run_git_command(
                     args=["git", "status", "--porcelain"],
                     cwd=Path(worktree_path),
+                    runtime_context=runtime_context,
                 )
                 entry["dirty"] = bool(status.stdout.strip())
             except ToolFailure:
@@ -129,17 +152,20 @@ def closeout_task_worktree(
         _run_git_command(
             args=["git", "merge", "--no-ff", branch_name, "-m", f"merge task/{task_id}: {task.get('title', '')}"],
             cwd=runtime_context.workspace_root,
+            runtime_context=runtime_context,
         )
         # merge 成功后，清理 worktree 和分支。
         if Path(worktree_path).exists():
             _run_git_command(
                 args=["git", "worktree", "remove", "--force", worktree_path],
                 cwd=runtime_context.workspace_root,
+                runtime_context=runtime_context,
             )
         try:
             _run_git_command(
                 args=["git", "branch", "-d", branch_name],
                 cwd=runtime_context.workspace_root,
+                runtime_context=runtime_context,
             )
         except ToolFailure:
             # 分支删除失败不影响主流程。
@@ -147,7 +173,7 @@ def closeout_task_worktree(
         task["worktree_name"] = None
         task["worktree_path"] = None
         task["worktree_branch"] = None
-        updated = save_task(runtime_context.tasks_dir, task)
+        updated = _save_worktree_fields(runtime_context, task)
         if runtime_context.team_runtime is not None:
             runtime_context.team_runtime.clear_worktree_binding(worktree_path=worktree_path)
         return updated
@@ -158,6 +184,7 @@ def closeout_task_worktree(
             _run_git_command(
                 args=["git", "worktree", "remove", "--force", worktree_path],
                 cwd=runtime_context.workspace_root,
+                runtime_context=runtime_context,
             )
         # 清理关联分支（忽略失败）。
         if branch_name:
@@ -165,13 +192,14 @@ def closeout_task_worktree(
                 _run_git_command(
                     args=["git", "branch", "-D", branch_name],
                     cwd=runtime_context.workspace_root,
+                    runtime_context=runtime_context,
                 )
             except ToolFailure:
                 pass
         task["worktree_name"] = None
         task["worktree_path"] = None
         task["worktree_branch"] = None
-        updated = save_task(runtime_context.tasks_dir, task)
+        updated = _save_worktree_fields(runtime_context, task)
         if runtime_context.team_runtime is not None:
             runtime_context.team_runtime.clear_worktree_binding(worktree_path=worktree_path)
         return updated

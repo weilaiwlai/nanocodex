@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import subprocess
 from pathlib import Path
 
 # 这是 agent 自己代码仓库的稳定根目录，只用于源码和内置资源。
@@ -24,25 +23,23 @@ def get_app_home_dir() -> Path:
 
 def _read_git_common_dir(workspace_root: Path) -> Path | None:
     """通过 git rev-parse --git-common-dir 读取仓库的 git common 目录，用于识别同一仓库（包括 worktree 场景）。"""
-    completed = subprocess.run(
-        [
-            "git",
-            "-C",
-            str(workspace_root),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if completed.returncode != 0:
+    marker = workspace_root / ".git"
+    if marker.is_dir():
+        return marker.resolve()
+    if not marker.is_file():
         return None
-    output = completed.stdout.strip()
-    if not output:
+    # Inspect only the worktree metadata; startup never executes repository code.
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+        if not text.startswith("gitdir: "):
+            return None
+        git_dir = (workspace_root / text[8:]).resolve()
+        common = git_dir / "commondir"
+        if common.is_file():
+            return (git_dir / common.read_text(encoding="utf-8").strip()).resolve()
+        return git_dir
+    except (OSError, ValueError):
         return None
-    return Path(output).resolve()
 
 
 def get_workspace_project_identity_root(workspace_root: Path | None = None) -> Path:

@@ -9,7 +9,9 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 import tiktoken
-from agents import Agent, Runner, SQLiteSession, TResponseInputItem
+from agents import Agent, Runner, TResponseInputItem
+from src.runtime.history import AtomicSQLiteSession as SQLiteSession
+from src.context.budget import complete_tool_pairs
 from pydantic import BaseModel, Field
 
 from src.runtime.paths import display_path, get_default_workspace_root
@@ -383,7 +385,7 @@ def estimate_context_tokens(
             _serialize_for_tokens([_item_to_dict(item) for item in current_turn_items]),
         ]
     )
-    return len(encoding.encode(payload))
+    return len(encoding.encode(payload, disallowed_special=()))
 
 
 def _render_history_for_summary(history_items: list[TResponseInputItem]) -> str:
@@ -399,7 +401,7 @@ def _render_history_for_summary(history_items: list[TResponseInputItem]) -> str:
     return "\n".join(rendered_lines).strip()
 
 
-async def generate_history_summary(
+async def _generate_history_summary_single(
     history_items: list[TResponseInputItem],
     model: str,
 ) -> HistorySummary:
@@ -489,6 +491,39 @@ async def generate_history_summary(
     )
 
 
+async def generate_history_summary(history_items: list[TResponseInputItem], model: str) -> HistorySummary:
+    from src.context.budget import count_tokens, input_budget, ContextBudgetExceeded
+    # The summarizer is also a model call: never send the unbounded archive to it.
+    limit = input_budget() - 2048
+    if limit < 256:
+        raise ContextBudgetExceeded('摘要模型输入预算不足，请提高输入预算。')
+    text = _render_history_for_summary(history_items)
+    for _ in range(4):
+        if count_tokens(text, model) <= limit:
+            return await _generate_history_summary_single([{'role': 'user', 'content': text}], model)
+        parts = []
+        remaining = text
+        while remaining:
+            low, high = 1, len(remaining)
+            while low < high:
+                middle = (low + high + 1) // 2
+                if count_tokens(remaining[:middle], model) <= limit:
+                    low = middle
+                else:
+                    high = middle - 1
+            parts.append(remaining[:low])
+            remaining = remaining[low:]
+        summaries = []
+        for part in parts:
+            summary = await _generate_history_summary_single([{'role': 'user', 'content': part}], model)
+            summaries.append(summary.to_message_text())
+        reduced = '\n\n'.join(summaries)
+        if count_tokens(reduced, model) >= count_tokens(text, model):
+            raise ContextBudgetExceeded('历史摘要未能缩小输入，原历史保留。')
+        text = reduced
+    raise ContextBudgetExceeded('历史过大，摘要预算仍不足，原历史保留。')
+
+
 def build_summary_message_item(summary: HistorySummary) -> TResponseInputItem:
     return {
         "role": "system",
@@ -525,7 +560,7 @@ async def compact_session_history(
     force: bool = False,
 ) -> SessionCompactionResult:
     active_config = config or get_context_compaction_config()
-    raw_items = list(await session.get_items())
+    raw_items, revision = await session.snapshot()
     if not raw_items:
         return SessionCompactionResult(compacted=False, summary=None, archive_path=None)
     if not force and len(raw_items) < active_config.min_messages:
@@ -541,9 +576,8 @@ async def compact_session_history(
 
     # session 中只保留一个 summary 项；旧 summary 也会被这次新摘要吸收进来。
     non_summary_items = [item for item in raw_items if not _is_summary_message(item)]
-    recent_items = _remove_orphaned_tool_pairs(non_summary_items[-active_config.keep_recent_items :])
-    await session.clear_session()
-    await session.add_items([build_summary_message_item(summary), *recent_items])
+    recent_items = complete_tool_pairs(non_summary_items[-active_config.keep_recent_items :])
+    await session.replace_items([build_summary_message_item(summary), *recent_items], expected_revision=revision)
     return SessionCompactionResult(
         compacted=True,
         summary=summary,

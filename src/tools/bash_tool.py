@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import os
+import asyncio
+from src.runtime.async_utils import async_call
 import re
 import shlex
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +21,7 @@ from src.tools.common import (
     error_from_failure,
     maybe_truncate_output_text,
     resolve_workspace_path,
-    run_traced_tool,
+    run_traced_tool_async,
     start_timer,
 )
 
@@ -137,12 +137,6 @@ def _validate_command(command: str) -> str:
                 message="命令被安全规则阻止。",
                 text="命令被阻止：当前 Bash 工具不支持交互式命令。",
             )
-        if lower_word in BLOCKED_NETWORK_COMMANDS:
-            raise ToolFailure(
-                code="COMMAND_BLOCKED",
-                message="命令被安全规则阻止。",
-                text="命令被阻止：当前 Bash 工具不允许执行网络命令。",
-            )
         if lower_word in BLOCKED_PRIVILEGED_COMMANDS:
             raise ToolFailure(
                 code="COMMAND_BLOCKED",
@@ -177,7 +171,7 @@ def _validate_timeout(timeout_ms: int) -> int:
 
 def _resolve_directory(directory: str, *, runtime_context: ToolRuntimeContext | None):
     workspace_root = runtime_context.execution_root if runtime_context is not None else None
-    workspace_path = resolve_workspace_path(directory, workspace_root=workspace_root)
+    workspace_path = resolve_workspace_path(directory, workspace_root=workspace_root, runtime_context=runtime_context)
     ensure_exists(workspace_path)
     if not workspace_path.resolved.is_dir():
         raise ToolFailure(
@@ -272,165 +266,52 @@ def run_bash(
             directory_resolved=directory if directory else ".",
         )
 
-    env = dict(os.environ)
-    env["MYCODEAGENT"] = "1"
-
+    from src.runtime.permissions import PermissionDenied
+    context = runtime_context or ToolRuntimeContext(
+        workspace_root=workspace_directory.resolved, execution_root=workspace_directory.resolved)
+    owned_manager = runtime_context is None
     try:
-        # 这里显式用 `/bin/bash -lc`，让工具语义稳定在“单次非交互 bash 命令”上。
-        completed = subprocess.run(
-            ["/bin/bash", "-lc", normalized_command],
-            cwd=workspace_directory.resolved,
-            env=env,
-            capture_output=True,
-            timeout=validated_timeout / 1000,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        stdout = _normalize_output(exc.stdout)
-        stderr = _normalize_output(exc.stderr)
-        if not stdout and not stderr:
-            return error_from_failure(
-                ToolFailure(
-                    code="TIMEOUT",
-                    message="命令执行超时。",
-                    text="命令执行超时，且没有产生可复用输出。",
-                ),
-                start_time=start_time,
-                params_input=params_input,
-                cwd=workspace_directory.relative_posix,
-                directory_resolved=workspace_directory.relative_posix,
-                data={
-                    "stdout": "",
-                    "stderr": "",
-                    "exit_code": None,
-                    "command": normalized_command,
-                    "directory": workspace_directory.relative_posix,
-                    "timed_out": True,
-                    "truncated": False,
-                },
-            )
-
-        stats = build_stats(
-            start_time,
-            stdout_bytes=len(stdout.encode("utf-8")),
-            stderr_bytes=len(stderr.encode("utf-8")),
-        )
-        data = {
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": None,
-            "command": normalized_command,
-            "directory": workspace_directory.relative_posix,
-            "timed_out": True,
-            "truncated": False,
-        }
-        text = _build_text(
-            command=normalized_command,
-            exit_code=None,
-            time_ms=int(stats["time_ms"]),
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=True,
-        )
-        data, text, _output_truncated = _apply_bash_output_truncation(
-            data=data,
-            text=text,
-            runtime_context=runtime_context,
-            workspace_root=workspace_directory.resolved,
-        )
-        return partial_response(
-            data=data,
-            text=text,
-            stats=stats,
-            context=build_context(
-                params_input=params_input,
-                cwd=workspace_directory.relative_posix,
-                directory_resolved=workspace_directory.relative_posix,
-            ),
-        )
-    except OSError as exc:
+        session = context.command_manager.start(
+            normalized_command, cwd=workspace_directory.resolved,
+            policy=context.execution_policy(), output_dir=context.session_dir / "commands",
+            timeout=validated_timeout / 1000, owner=context.actor_name,
+            emit=context.emit_runtime_event)
+        result = context.command_manager.wait(session.id, cancelled=context.cancel_event)
+    except (OSError, ValueError, RuntimeError) as exc:
+        code = "ACCESS_DENIED" if isinstance(exc, PermissionDenied) else "EXECUTION_ERROR"
         return error_from_failure(
-            ToolFailure(
-                code="EXECUTION_ERROR",
-                message=f"命令执行异常：{exc}",
-                text="命令执行失败：本地 shell 进程无法正常启动。",
-            ),
-            start_time=start_time,
-            params_input=params_input,
-            cwd=workspace_directory.relative_posix,
-            directory_resolved=workspace_directory.relative_posix,
-        )
-
-    stdout = _normalize_output(completed.stdout)  #统一转换为字符串格式
-    stderr = _normalize_output(completed.stderr)  #统一转换为字符串格式
-    stats = build_stats(
-        start_time,
-        stdout_bytes=len(stdout.encode("utf-8")),
-        stderr_bytes=len(stderr.encode("utf-8")),
-    )  # 统计 stdout 和 stderr 的字节数
-    data = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": completed.returncode,
-        "command": normalized_command,
-        "directory": workspace_directory.relative_posix,
-        "timed_out": False,
-        "truncated": False,
-    }
-    text = _build_text(
-        command=normalized_command,
-        exit_code=completed.returncode,
-        time_ms=int(stats["time_ms"]),
-        stdout=stdout,
-        stderr=stderr,
-        timed_out=False,
-    )
-    data, text, output_truncated = _apply_bash_output_truncation(
-        data=data,
-        text=text,
-        runtime_context=runtime_context,
-        workspace_root=workspace_directory.resolved,
-    )  #输出截断处理
-    response_builder = (
-        success_response
-        if completed.returncode == 0 and not output_truncated
-        else partial_response
-    )
-    return response_builder(
-        data=data,
-        text=text,
-        stats=stats,
-        context=build_context(
-            params_input=params_input,
-            cwd=workspace_directory.relative_posix,
-            directory_resolved=workspace_directory.relative_posix,
-        ),
-    )
+            ToolFailure(code=code, message=str(exc), text=str(exc)),
+            start_time=start_time, params_input=params_input,
+            cwd=workspace_directory.relative_posix)
+    finally:
+        if owned_manager:
+            context.command_manager.close()
+    stdout, stderr = result["stdout"], result["stderr"]
+    timed_out = result["status"] == "timed_out"
+    data = dict(result, command=normalized_command, directory=workspace_directory.relative_posix,
+                timed_out=timed_out, truncated=result["output_truncated"])
+    stats = build_stats(start_time, stdout_bytes=len(stdout.encode("utf-8")),
+                        stderr_bytes=len(stderr.encode("utf-8")))
+    text = _build_text(command=normalized_command, exit_code=result["exit_code"],
+                       time_ms=int(stats["time_ms"]), stdout=stdout, stderr=stderr, timed_out=timed_out)
+    text += f'\nprocess_id: {session.id}\nstatus: {result["status"]}\nlog: {result["log_path"]}'
+    data, text, truncated = _apply_bash_output_truncation(
+        data=data, text=text, runtime_context=runtime_context, workspace_root=workspace_directory.resolved)
+    response = success_response if result["status"] == "completed" and not truncated else partial_response
+    return response(data=data, text=text, stats=stats,
+                    context=build_context(params_input=params_input, cwd=workspace_directory.relative_posix))
 
 
-def _bash_tool(
+async def _bash_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     command: str,
     directory: str = ".",
     timeout_ms: int = DEFAULT_TIMEOUT_MS,
 ) -> ToolResponse:
-    # Bash 主体仍然保持最小执行语义；wrapper 额外负责 tool tracing。
-    params_input = {
-        "command": command,
-        "directory": directory,
-        "timeout_ms": timeout_ms,
-    }
-    return run_traced_tool(
-        ctx.context,
-        tool_name="Bash",
-        params_input=params_input,
-        invoke=lambda: run_bash(
-            command=command,
-            directory=directory,
-            timeout_ms=timeout_ms,
-            runtime_context=ctx.context,
-        ),
-    )
+    params_input = dict(command=command, directory=directory, timeout_ms=timeout_ms)
+    return await run_traced_tool_async(
+        ctx.context, tool_name="Bash", params_input=params_input,
+        invoke=lambda: async_call(run_bash, command, directory, timeout_ms, ctx.context))
 
 
 bash_tool = function_tool(

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from src.runtime.async_utils import async_call
+
 from pathlib import Path
 
 from agents import RunContextWrapper, function_tool
@@ -18,7 +20,7 @@ from src.tools.common import (
     read_workspace_text_file,
     require_existing_file_lock,
     resolve_workspace_path,
-    run_traced_tool,
+    run_traced_tool_async,
     start_timer,
 )
 
@@ -132,6 +134,8 @@ def edit_file(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
+            operation="write",
         )
         ensure_exists(workspace_path)
         if workspace_path.resolved.is_dir():
@@ -259,6 +263,8 @@ def write_file(
             path,
             workspace_root=workspace_root,
             allow_roots=_memory_allow_roots(runtime_context),
+            runtime_context=runtime_context,
+            operation="write",
         )
         path_resolved = workspace_path.relative_posix
         target_exists = workspace_path.resolved.exists()
@@ -343,7 +349,7 @@ def write_file(
         )
 
 
-def _edit_file_tool(
+async def _edit_file_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     path: str,
     old_string: str,
@@ -354,11 +360,11 @@ def _edit_file_tool(
         "old_string": old_string,
         "new_string": new_string,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="Edit",
         params_input=params_input,
-        invoke=lambda: edit_file(
+        invoke=lambda: async_call(edit_file,
             path=path,
             old_string=old_string,
             new_string=new_string,
@@ -367,7 +373,7 @@ def _edit_file_tool(
     )
 
 
-def _write_file_tool(
+async def _write_file_tool(
     ctx: RunContextWrapper[ToolRuntimeContext],
     path: str,
     content: str,
@@ -376,11 +382,11 @@ def _write_file_tool(
         "path": path,
         "content": content,
     }
-    return run_traced_tool(
+    return await run_traced_tool_async(
         ctx.context,
         tool_name="Write",
         params_input=params_input,
-        invoke=lambda: write_file(
+        invoke=lambda: async_call(write_file,
             path=path,
             content=content,
             runtime_context=ctx.context,

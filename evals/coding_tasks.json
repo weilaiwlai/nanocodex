@@ -1,0 +1,27 @@
+[
+  {
+    "id": "fix_discount",
+    "prompt": "Fix discount_price in prices.py. It should return price after a percentage discount. A price of 100 with discount 20 should give 80; handle zero and full discounts. Keep the function name and parameters.",
+    "files": {
+      "prices.py": "def discount_price(price, percent):\n    return price * percent / 100\n"
+    },
+    "verifier": "import runpy,sys\nfrom pathlib import Path\nf=runpy.run_path(str(Path(sys.argv[1])/'prices.py'))['discount_price']\nfor p,d in [(100,20),(17.5,0),(42,100),(80,25)]:\n    assert abs(f(p,d)-p*(1-d/100))<1e-9,(p,d)\nprint('discount checks passed')\n"
+  },
+  {
+    "id": "add_slugify",
+    "prompt": "Implement slugify(text) in text_utils.py: lowercase, trim surrounding whitespace, replace each run of non-ASCII letters/digits with one hyphen, and remove leading/trailing hyphens. Keep existing normalize_space working.",
+    "files": {
+      "text_utils.py": "def normalize_space(text):\n    return ' '.join(text.split())\n"
+    },
+    "verifier": "import runpy,sys\nfrom pathlib import Path\nm=runpy.run_path(str(Path(sys.argv[1])/'text_utils.py'))\nassert m['normalize_space'](' a  b ')=='a b'\nfor text,want in [('Hello, World!','hello-world'),('  A___B  ','a-b'),('---',''),('v2.0','v2-0')]:\n    assert m['slugify'](text)==want,(text,want)\nprint('slug checks passed')\n"
+  },
+  {
+    "id": "cross_file_total",
+    "prompt": "Fix checkout.total in checkout.py so it sums quantity times unit_price from catalog.PRICES for each item. Empty carts return zero and unknown items raise KeyError. Preserve catalog.py prices.",
+    "files": {
+      "catalog.py": "PRICES = {'apple': 2.5, 'pear': 3.0}\n",
+      "checkout.py": "from catalog import PRICES\n\n\ndef total(cart):\n    return sum(cart.values())\n"
+    },
+    "verifier": "import sys\nfrom pathlib import Path\nsys.path.insert(0,str(Path(sys.argv[1])))\nfrom checkout import total\nfrom catalog import PRICES\nassert PRICES=={'apple':2.5,'pear':3.0}\nassert total({})==0\nassert total({'apple':3,'pear':2})==13.5\ntry:\n    total({'missing':1})\nexcept KeyError:\n    pass\nelse:\n    raise AssertionError('unknown item must raise KeyError')\nprint('cart checks passed')\n"
+  }
+]

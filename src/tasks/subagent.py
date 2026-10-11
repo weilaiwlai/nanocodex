@@ -1,9 +1,14 @@
 from __future__ import annotations
 
-from agents import Agent, Runner
+from agents import Agent, Runner, RunConfig
+from uuid import uuid4
+from src.context.budget import build_model_input_filter
+from src.runtime.streaming import controlled_run
+from src.tasks.lease import LeaseHeartbeat
 
 from src.runtime.session import ToolRuntimeContext
-from src.tasks.task_graph import update_task
+from src.tasks.task_graph import update_task, claim_task
+from src.tasks.task_store import TaskConflict
 from src.tasks.task_store import get_task
 from src.tools.read_only import READ_ONLY_TOOLS
 from src.tools.todo_write import TODO_TOOLS
@@ -46,13 +51,13 @@ async def run_subagent_task(
 ) -> dict[str, object]:
     # TaskRun 的职责是同步跑完一个分析子代理，再把摘要写回任务图。
     task = get_task(runtime_context.tasks_dir, task_id)
-    updated_task = update_task(
-        tasks_dir=runtime_context.tasks_dir,
-        task_id=task_id,
-        status="running",
-        owner=f"subagent:{task.get('subagent_type') or 'general'}",
-        error=None,
-    )
+    owner_id = f"subagent-{uuid4().hex}"
+    updated_task = claim_task(tasks_dir=runtime_context.tasks_dir, task_id=task_id,
+                              owner_agent_id=owner_id, owner=f"subagent:{task.get('subagent_type') or 'general'}",
+                              lease_seconds=30)
+    if updated_task is None:
+        raise TaskConflict(f"task_{task_id} 正在执行、已结束或仍被依赖阻塞。")
+    fence = dict(expected_owner_agent_id=owner_id, expected_lease_token=updated_task["lease_token"])
     model = _resolve_model(runtime_context, updated_task.get("model_route"))
     tools = _resolve_tools(
         subagent_type=updated_task.get("subagent_type"),
@@ -66,19 +71,20 @@ async def run_subagent_task(
     )
     prompt = updated_task.get("prompt") or updated_task.get("summary") or updated_task.get("title")
     try:
-        result = await Runner.run(
-            agent,
-            input=str(prompt),
-            context=runtime_context,
-            max_turns=25,
-        )
+        with LeaseHeartbeat(tasks_dir=runtime_context.tasks_dir, task=updated_task, owner_agent_id=owner_id,
+                            on_lost=runtime_context.cancel_run):
+            result = await controlled_run(Runner.run(
+                agent,
+                input=str(prompt),
+                context=runtime_context,
+                max_turns=25,
+                run_config=RunConfig(call_model_input_filter=build_model_input_filter(runtime_context, model)),
+            ), runtime_context)
     except Exception as exc:
-        failed_task = update_task(
-            tasks_dir=runtime_context.tasks_dir,
-            task_id=task_id,
-            status="failed",
-            error=str(exc),
-        )
+        try:
+            update_task(tasks_dir=runtime_context.tasks_dir, task_id=task_id, status="failed", error=str(exc), **fence)
+        except TaskConflict:
+            pass
         raise RuntimeError(f"子代理任务失败: task_{task_id}") from exc
 
     final_output = result.final_output if isinstance(result.final_output, str) else str(result.final_output)
@@ -88,6 +94,7 @@ async def run_subagent_task(
         status="completed",
         result_summary=final_output,
         error=None,
+        **fence,
     )
     return {
         "task": completed_task,

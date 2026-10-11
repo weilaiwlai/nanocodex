@@ -1,21 +1,19 @@
-"""任务图、子代理和后台执行能力。"""
+"""Task storage remains usable without loading the model SDK."""
 
-from src.tasks.background import (
-    drain_notifications,
-    mark_interrupted_running_tasks,
-    start_background_command,
-)
-from src.tasks.subagent import run_subagent_task
-from src.tasks.task_graph import update_task
-from src.tasks.task_store import create_task, get_task, list_tasks
+from importlib import import_module
 
-__all__ = [
-    "create_task",
-    "get_task",
-    "list_tasks",
-    "update_task",
-    "run_subagent_task",
-    "start_background_command",
-    "drain_notifications",
-    "mark_interrupted_running_tasks",
-]
+_EXPORTS = {
+    "create_task": "task_store", "get_task": "task_store", "list_tasks": "task_store",
+    "update_task": "task_graph", "run_subagent_task": "subagent",
+    "start_background_command": "background", "drain_notifications": "background",
+    "mark_interrupted_running_tasks": "background",
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(f"src.tasks.{_EXPORTS[name]}"), name)
+    globals()[name] = value
+    return value

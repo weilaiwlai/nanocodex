@@ -9,10 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from agents import Agent, Runner, SQLiteSession
+from agents import Agent, Runner, RunConfig
+from src.runtime.history import AtomicSQLiteSession as SQLiteSession
+from src.runtime.streaming import controlled_run
+from src.context.budget import build_model_input_filter
+from src.tasks.lease import LeaseHeartbeat
+from src.tasks.task_store import TaskConflict
+from types import SimpleNamespace
 
 from src.runtime.session import ToolRuntimeContext
 from src.runtime.tracing import build_trace_logger
+from src.runtime.persistence import write_json_atomic
 from src.tasks.task_graph import claim_task as claim_persistent_task, renew_task_lease, update_task
 from src.tasks.task_store import get_task
 from src.tasks.worktrees import ensure_task_worktree
@@ -86,12 +93,7 @@ def _build_transcript_event(
 def _write_json_file(path: Path, payload: dict[str, object]) -> None:
     # team_state 和 request_tracker 会被多线程快速读写。
     # 这里用同目录临时文件再 replace，避免读到半截 JSON。
-    temp_path = path.with_name(f"{path.name}.tmp")
-    temp_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temp_path.replace(path)
+    write_json_atomic(path, payload)
 
 
 def _build_message_input(message: dict[str, object]) -> dict[str, str]:
@@ -191,6 +193,7 @@ def _build_teammate_instructions(*, name: str, role: str) -> str:
 
 def _build_teammate_tools():
     # teammate 工具集先复用现有工作工具，再补最小 team phase 2 工具。
+    from src.tools.execution_tools import EXECUTION_TOOLS
     from src.tools.team_tools import (
         claim_task_tool,
         idle_tool,
@@ -203,6 +206,7 @@ def _build_teammate_tools():
         *READ_ONLY_TOOLS,
         *FILE_EDIT_TOOLS,
         *BASH_TOOLS,
+        *EXECUTION_TOOLS,
         *TASK_TOOLS,
         send_message_tool,
         claim_task_tool,
@@ -223,6 +227,7 @@ class TeammateWorker:
     transcript_path: Path
     recent_transcript_path: Path
     context: ToolRuntimeContext
+    lease_heartbeat: LeaseHeartbeat | None = field(default=None, init=False)
     sdk_session: SQLiteSession
     message_queue: queue.Queue[dict[str, object]]
     stop_event: threading.Event = field(default_factory=threading.Event)
@@ -503,6 +508,11 @@ class AgentTeamRuntime:
             main_model=self.base_context.main_model,
             light_model=self.base_context.light_model,
             actor_name=name,
+            owner_agent_id=agent_id,
+            permission_broker=self.base_context.permission_broker,
+            command_manager=self.base_context.command_manager,
+            runtime_events=self.base_context.runtime_events,
+            runtime_event_lock=self.base_context.runtime_event_lock,
             team_runtime=self,
             trace_logger=build_trace_logger(
                 f"{self.base_context.session_id}-{agent_id}",
@@ -512,6 +522,13 @@ class AgentTeamRuntime:
 
     def _claim_task_for_worker(self, worker: TeammateWorker) -> dict[str, object] | None:
         # teammate 空闲时，先尝试从 task board 里拿一条未被阻塞的任务。
+        if worker.context.active_task_id is not None:
+            existing = get_task(self.base_context.tasks_dir, worker.context.active_task_id)
+            if existing["status"] == "running" and existing.get("lease_token") == worker.context.active_lease_token:
+                return existing
+        if worker.lease_heartbeat is not None:
+            worker.lease_heartbeat.__exit__()
+            worker.lease_heartbeat = None
         claimed_task = claim_persistent_task(
             tasks_dir=self.base_context.tasks_dir,
             owner_agent_id=worker.agent_id,
@@ -519,7 +536,16 @@ class AgentTeamRuntime:
             lease_seconds=TEAM_TASK_LEASE_SECONDS,
         )
         if claimed_task is None:
+            worker.context.active_task_id = None
+            worker.context.active_lease_token = None
             return None
+        worker.context.active_task_id = int(claimed_task["id"])
+        worker.context.active_lease_token = str(claimed_task["lease_token"])
+        worker.lease_heartbeat = LeaseHeartbeat(
+            tasks_dir=self.base_context.tasks_dir, task=claimed_task,
+            owner_agent_id=worker.agent_id, lease_seconds=TEAM_TASK_LEASE_SECONDS,
+            on_lost=worker.context.cancel_run)
+        worker.lease_heartbeat.__enter__()
 
         self._update_member(
             worker.name,
@@ -545,6 +571,7 @@ class AgentTeamRuntime:
             task_id=task_id,
             owner_agent_id=worker.agent_id,
             lease_seconds=TEAM_TASK_LEASE_SECONDS,
+            lease_token=worker.context.active_lease_token,
         )
         self._update_member(
             worker.name,
@@ -562,7 +589,7 @@ class AgentTeamRuntime:
         # 需要隔离的任务切到 task 专属 worktree，否则回到 session 的 workspace_root。
         if task.get("require_worktree"):
             task = ensure_task_worktree(
-                runtime_context=self.base_context,
+                runtime_context=worker.context,
                 task_id=int(task["id"]),
             )
             worktree_path = Path(str(task["worktree_path"]))
@@ -608,7 +635,14 @@ class AgentTeamRuntime:
                 owner=f"teammate:{worker.name}",
                 result_summary=final_output,
                 error=None,
+                expected_owner_agent_id=worker.agent_id,
+                expected_lease_token=worker.context.active_lease_token,
             )
+        if worker.lease_heartbeat is not None:
+            worker.lease_heartbeat.__exit__()
+            worker.lease_heartbeat = None
+        worker.context.active_task_id = None
+        worker.context.active_lease_token = None
         self._update_member(
             worker.name,
             status="idle",
@@ -625,6 +659,23 @@ class AgentTeamRuntime:
             ),
         )
         return task
+
+    async def _run_worker_turn(self, worker, current_input):
+        from src.context import build_context_bundle
+        model = worker.context.main_model or worker.context.current_model or "gpt-5.2-codex"
+        tools = _build_teammate_tools()
+        facade = SimpleNamespace(context=worker.context, session=worker.sdk_session,
+                                 session_id=f"{self.session_id}-{worker.agent_id}")
+        bundle = await build_context_bundle(user_input=current_input["content"], session_runtime=facade,
+                                            tool_names=[tool.name for tool in tools], model_name=model)
+        agent = Agent(name=worker.name, model=model, tools=tools,
+                      instructions=bundle.build_agent_instructions() + "\n" +
+                      _build_teammate_instructions(name=worker.name, role=worker.role))
+        config = RunConfig(
+            session_input_callback=lambda _history, new: [*bundle.runtime.history_items, *new],
+            call_model_input_filter=build_model_input_filter(worker.context, model))
+        return await Runner.run(agent, input=bundle.build_runner_input(), session=worker.sdk_session,
+                                context=worker.context, run_config=config, max_turns=30)
 
     def _run_worker_loop(self, worker: TeammateWorker) -> None:
         # teammate 的生命周期是：创建后先进入 working，再立即转成 idle 等待消息。
@@ -695,35 +746,13 @@ class AgentTeamRuntime:
                 )
                 current_input = _build_message_input(message)
             else:
-                self._renew_task_lease_for_worker(worker, task_id=int(claimed_task["id"]))
-                claimed_task = self._bind_task_execution_root_for_worker(
-                    worker,
-                    task=claimed_task,
-                )
                 current_input = _build_task_input(claimed_task)
-
-            agent = Agent(
-                name=worker.name,
-                instructions=_build_teammate_instructions(
-                    name=worker.name,
-                    role=worker.role,
-                ),
-                model=worker.context.main_model or worker.context.current_model or "gpt-5.2-codex",
-                tools=_build_teammate_tools(),
-            )
 
             run_start_ms = int(datetime.now().timestamp() * 1000)
             try:
-                # 每个 teammate 拥有独立 SQLiteSession，由 SDK 管理对话历史和持久化。
-                result = asyncio.run(
-                    Runner.run(
-                        agent,
-                        input=[current_input],
-                        session=worker.sdk_session,
-                        context=worker.context,
-                        max_turns=30,
-                    )
-                )
+                if claimed_task is not None:
+                    claimed_task = self._bind_task_execution_root_for_worker(worker, task=claimed_task)
+                result = asyncio.run(controlled_run(self._run_worker_turn(worker, current_input), worker.context))
             except Exception as exc:
                 run_duration_ms = int(datetime.now().timestamp() * 1000) - run_start_ms
                 # 这里只把 teammate 标成 failed，不在这里打复杂恢复补丁。
@@ -737,14 +766,18 @@ class AgentTeamRuntime:
                         duration_ms=run_duration_ms,
                     ),
                 )
-                if claimed_task is not None:
-                    update_task(
-                        tasks_dir=self.base_context.tasks_dir,
-                        task_id=int(claimed_task["id"]),
-                        status="failed",
-                        owner=f"teammate:{worker.name}",
-                        error=str(exc),
-                    )
+                if worker.context.active_task_id is not None:
+                    try:
+                        update_task(tasks_dir=self.base_context.tasks_dir,
+                                    task_id=worker.context.active_task_id, status="failed",
+                                    owner=f"teammate:{worker.name}", error=str(exc),
+                                    expected_owner_agent_id=worker.agent_id,
+                                    expected_lease_token=worker.context.active_lease_token)
+                    except TaskConflict:
+                        pass  # A new owner has already taken over; discard this worker's result.
+                    if worker.lease_heartbeat is not None:
+                        worker.lease_heartbeat.__exit__()
+                        worker.lease_heartbeat = None
                     self._update_member(worker.name, current_task_id=None)
                 self._update_member(worker.name, status="failed")
                 return
@@ -771,11 +804,12 @@ class AgentTeamRuntime:
             if claimed_task is None:
                 self._update_member(worker.name, status="idle")
             else:
-                self._finish_claimed_task(
-                    worker,
-                    task_id=int(claimed_task["id"]),
-                    final_output=final_output,
-                )
+                try:
+                    self._finish_claimed_task(worker, task_id=int(claimed_task["id"]), final_output=final_output)
+                except TaskConflict:
+                    worker.context.cancel_run()
+                    self._update_member(worker.name, status="failed", current_task_id=None)
+                    return
 
         # 收到停止请求后，线程最终会收敛到 stopped。
         self._update_member(worker.name, status="stopped")
@@ -993,6 +1027,10 @@ class AgentTeamRuntime:
             worker = self._workers.get(actor_name)
             if worker is not None:
                 worker.stop_event.set()
+        worker.context.cancel_run()
+        if worker.lease_heartbeat is not None:
+            worker.lease_heartbeat.__exit__()
+            worker.lease_heartbeat = None
         message = self.send_message(
             from_name=actor_name,
             to_name=str(record["from"]),

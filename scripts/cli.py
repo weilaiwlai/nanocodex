@@ -68,7 +68,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?",
         help="User request. If omitted, the CLI will open an interactive prompt.",
     )
+    parser.add_argument('--control-stdin', action='store_true', help='Read cancellation and approval JSONL from stdin.')
+    parser.add_argument('--allow-network', action='store_true', help='Explicitly allow network access for commands this session.')
+    parser.add_argument('--allow-read', action='append', default=[], metavar='PATH', help='Explicitly allow reading PATH.')
+    parser.add_argument('--allow-write', action='append', default=[], metavar='PATH', help='Explicitly allow writing PATH.')
     return parser.parse_args(argv)
+
+
+def configure_controls(runtime, args):
+    from src.runtime.control import start_control_reader
+    from src.runtime.terminal import terminal_permission
+    broker = runtime.context.permission_broker
+    broker.grant(read_paths=args.allow_read, write_paths=args.allow_write, network=args.allow_network)
+    if args.control_stdin:
+        start_control_reader(runtime.context, sys.stdin)
+    else:
+        broker.handler = (lambda _payload: False) if args.json_events else terminal_permission
 
 
 def build_prompt_session() -> PromptSession[str]:
@@ -99,6 +114,7 @@ def stream_reply(
 ) -> None:
     """同步包装：流式输出 Agent 回复,_stream_reply_events() 的 同步包装器"""
     session_runtime.update_name_from_user_input(user_input)
+    session_runtime.context.cancel_event.clear()
     print("Agent>")
     try:
         asyncio.run(_stream_reply_events(user_input, config, session_runtime))
@@ -164,6 +180,14 @@ def render_runtime_event(
     # assistant 文本继续走主输出区，tool_result 默认只显示摘要，不把完整结果直接刷屏。
     event_type = event.get("type")
     payload = event.get("payload")
+    if event_type == 'command_output' and isinstance(payload, dict):
+        write(str(payload.get('text', '')))
+        return True
+    if event_type in {'command_started', 'command_finished', 'context_compacted', 'run_failed'} and isinstance(payload, dict):
+        if printed_text:
+            write('\n')
+        write(f'[{event_type}] {payload.get("status") or payload.get("command") or payload.get("message") or payload}\n')
+        return False
 
     if event_type == "assistant_text_delta" and isinstance(payload, dict):
         delta = payload.get("delta")
@@ -246,6 +270,7 @@ def run_repl(
     session_id: str | None = None,
     new_session: bool = False,
     workspace_root: Path | None = None,
+    cli_args=None,
 ) -> int:
     """运行交互式 REPL，处理用户输入并渲染模型回复"""
     session = build_prompt_session()
@@ -259,8 +284,10 @@ def run_repl(
         print(str(exc), file=sys.stderr)
         return 1
     print(f"Session: {session_runtime.session_name} ({session_runtime.session_id})")
+    if cli_args is not None:
+        configure_controls(session_runtime, cli_args)
     print(f"Workspace: {session_runtime.context.workspace_root}")
-    print("Enter 发送 | Esc Enter 换行 | Ctrl-D / Ctrl-C 退出")
+    print("Enter 发送 | Esc Enter 换行 | 运行时 Ctrl-C 取消 | 空闲时 Ctrl-D / Ctrl-C 退出")
 
     try:
         while True:
@@ -285,7 +312,8 @@ def run_repl(
                 print_connection_error()
             except KeyboardInterrupt:
                 print()
-                return 0
+                session_runtime.context.cancel_run()
+                continue
     finally:
         session_runtime.close()
 
@@ -294,7 +322,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     workspace_root = Path(args.workspace_root).expanduser() if args.workspace_root else None
 
-    config = load_runtime_config()
+    if args.control_stdin and (not args.json_events or args.prompt is None):
+        print('--control-stdin requires --json-events and a prompt.', file=sys.stderr)
+        return 2
     if args.json_events and args.prompt is None:
         print("`--json-events` 只能和单次 prompt 一起使用。", file=sys.stderr)
         return 2
@@ -326,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
         finally:
             session_runtime.close()
 
+    config = load_runtime_config()
     if args.prompt is not None:  #当用户 传入了位置参数 prompt （即 python scripts/cli.py "提问内容" ）时走这条路径
         try:
             session_runtime = build_cli_session_runtime(
@@ -338,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         try:
             user_input = args.prompt.strip()
+            configure_controls(session_runtime, args)
             if not user_input:
                 print("No input provided.", file=sys.stderr)
                 return 1
@@ -366,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         session_id=args.session_id,
         new_session=args.new_session,
         workspace_root=workspace_root,
+        cli_args=args,
     )
 
 
