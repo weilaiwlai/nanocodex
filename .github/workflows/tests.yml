@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  core:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install Linux sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+      - name: Install locked Python dependencies
+        run: uv sync --locked
+      - name: Run core tests
+        run: uv run python -m unittest discover -s tests/core -v
+      - name: Run Python compile check
+        run: uv run python -m compileall -q src scripts evals
+      - name: Run offline TUI tests
+        run: node scripts/test_tui_offline.mjs

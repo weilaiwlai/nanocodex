@@ -10,6 +10,7 @@ from src.tools.task_tools import TASK_TOOLS
 from src.tools.team_tools import TEAM_TOOLS
 from src.tools.todo_write import TODO_TOOLS
 from src.tools.worktree_tools import WORKTREE_TOOLS
+from src.tools.workflow_tools import WORKFLOW_TOOLS
 
 AGENT_TOOLS = [
     *READ_ONLY_TOOLS,
@@ -22,6 +23,7 @@ AGENT_TOOLS = [
     *WORKTREE_TOOLS,
     *SKILL_TOOLS,
     *TEAM_TOOLS,
+    *WORKFLOW_TOOLS,
 ]
 
 __all__ = [
@@ -34,5 +36,6 @@ __all__ = [
     "WORKTREE_TOOLS",
     "SKILL_TOOLS",
     "TEAM_TOOLS",
+    "WORKFLOW_TOOLS",
     "AGENT_TOOLS",
 ]

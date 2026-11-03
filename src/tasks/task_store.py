@@ -55,6 +55,64 @@ class TaskTransaction:
                                 (json.dumps(created, ensure_ascii=False), created["id"]))
         return created
 
+    def insert_workflow_definition(self, definition: dict[str, Any]) -> dict[str, Any]:
+        try:
+            self.connection.execute(
+                "INSERT INTO workflow_definitions(id,name,payload,revision) VALUES (?,?,?,0)",
+                (definition["id"], definition["name"], json.dumps(definition, ensure_ascii=False)),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise TaskConflict(f"工作流名称已存在：{definition['name']}") from exc
+        return dict(definition, revision=0)
+
+    def get_workflow_definition(self, workflow_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT payload,revision FROM workflow_definitions WHERE id=?", (workflow_id,)
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"工作流不存在：{workflow_id}")
+        return dict(json.loads(row[0]), revision=row[1])
+
+    def get_workflow_definition_by_name(self, name: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT payload,revision FROM workflow_definitions WHERE name=?", (name,)
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"工作流不存在：{name}")
+        return dict(json.loads(row[0]), revision=row[1])
+
+    def list_workflow_definitions(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT payload,revision FROM workflow_definitions ORDER BY name"
+        ).fetchall()
+        return [dict(json.loads(row[0]), revision=row[1]) for row in rows]
+
+    def insert_workflow_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        self.connection.execute(
+            "INSERT INTO workflow_runs(id,definition_id,payload,revision) VALUES (?,?,?,0)",
+            (run["id"], run["definition_id"], json.dumps(run, ensure_ascii=False)),
+        )
+        return dict(run, revision=0)
+
+    def get_workflow_run(self, run_id: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT payload,revision FROM workflow_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"工作流运行不存在：{run_id}")
+        return dict(json.loads(row[0]), revision=row[1])
+
+    def put_workflow_run(self, run: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_workflow_run(str(run["id"]))
+        if run.get("revision") != current["revision"]:
+            raise TaskConflict(f"工作流运行 {run['id']} 已被另一个执行者更新。")
+        updated = dict(run, revision=current["revision"] + 1, updated_at=_utc_now())
+        self.connection.execute(
+            "UPDATE workflow_runs SET payload=?,revision=? WHERE id=?",
+            (json.dumps(updated, ensure_ascii=False), updated["revision"], updated["id"]),
+        )
+        return updated
+
 
 @contextmanager
 def task_transaction(tasks_dir: Path) -> Iterator[TaskTransaction]:
@@ -65,6 +123,8 @@ def task_transaction(tasks_dir: Path) -> Iterator[TaskTransaction]:
         connection.execute("PRAGMA busy_timeout=10000")
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
+        connection.execute("CREATE TABLE IF NOT EXISTS workflow_definitions (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, payload TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
+        connection.execute("CREATE TABLE IF NOT EXISTS workflow_runs (id TEXT PRIMARY KEY, definition_id TEXT NOT NULL, payload TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0)")
         connection.execute("CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY)")
         if connection.execute("SELECT 1 FROM migrations WHERE name='legacy_json'").fetchone() is None:
             for path in sorted(tasks_dir.glob("task_*.json")):
@@ -104,11 +164,15 @@ def list_tasks(tasks_dir: Path) -> list[dict[str, Any]]:
 def create_task(*, tasks_dir: Path, title: str, summary: str, kind: str,
                 prompt: str | None = None, subagent_type: str | None = None,
                 model_route: str | None = None, require_worktree: bool = False,
+                assigned_agent: str | None = None, assigned_role: str | None = None,
                 owner: str = "main_agent", status: str = "pending") -> dict[str, Any]:
     now = _utc_now()
     task = dict(title=title.strip(), summary=summary.strip(), kind=kind, prompt=prompt or "",
                 status=status, owner=owner, owner_agent_id=None, subagent_type=subagent_type,
                 model_route=model_route, require_worktree=require_worktree, blockedBy=[], blocks=[],
+                depends_on=[], input_from=[], assigned_agent=assigned_agent, assigned_role=assigned_role,
+                workflow_run_id=None, workflow_step_id=None, attempts=0, max_retries=0,
+                retry_delay_seconds=0, available_at=None,
                 lease_expires_at=None, lease_token=None, lease_generation=0, worktree_name=None,
                 worktree_path=None, result_summary=None, result_artifact=None, error=None,
                 created_at=now, updated_at=now)

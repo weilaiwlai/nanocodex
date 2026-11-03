@@ -38,6 +38,8 @@ def task_create(
     subagent_type: str | None = None,
     model_route: str | None = None,
     require_worktree: bool = False,
+    assigned_agent: str | None = None,
+    assigned_role: str | None = None,
     runtime_context: ToolRuntimeContext | None = None,
 ) -> ToolResponse:
     # 任务创建只负责落盘一份最小任务对象，不在这里顺手执行任务。
@@ -50,6 +52,8 @@ def task_create(
         "subagent_type": subagent_type,
         "model_route": model_route,
         "require_worktree": require_worktree,
+        "assigned_agent": assigned_agent,
+        "assigned_role": assigned_role,
     }
     try:
         active_runtime_context = _require_runtime_context(runtime_context)
@@ -62,6 +66,8 @@ def task_create(
             subagent_type=subagent_type,
             model_route=model_route,
             require_worktree=require_worktree,
+            assigned_agent=assigned_agent,
+            assigned_role=assigned_role,
         )
         return success_response(
             data={"task": task},
@@ -178,6 +184,9 @@ def task_list(*, runtime_context: ToolRuntimeContext | None = None) -> ToolRespo
                 "title": task["title"],
                 "status": task["status"],
                 "owner": task["owner"],
+                "assigned_agent": task.get("assigned_agent"),
+                "assigned_role": task.get("assigned_role"),
+                "workflow_run_id": task.get("workflow_run_id"),
                 "require_worktree": task.get("require_worktree", False),
                 "worktree_name": task.get("worktree_name"),
                 "blockedBy": task["blockedBy"],
@@ -363,6 +372,8 @@ def _task_create_tool(
     prompt: str | None = None,
     subagent_type: str | None = None,
     model_route: str | None = None,
+    assigned_agent: str | None = None,
+    assigned_role: str | None = None,
 ) -> ToolResponse:
     params_input = {
         "title": title,
@@ -371,6 +382,8 @@ def _task_create_tool(
         "prompt": prompt,
         "subagent_type": subagent_type,
         "model_route": model_route,
+        "assigned_agent": assigned_agent,
+        "assigned_role": assigned_role,
     }
     return run_traced_tool(
         ctx.context,
@@ -383,6 +396,8 @@ def _task_create_tool(
             prompt=prompt,
             subagent_type=subagent_type,
             model_route=model_route,
+            assigned_agent=assigned_agent,
+            assigned_role=assigned_role,
             runtime_context=ctx.context,
         ),
     )
@@ -507,7 +522,7 @@ async def _background_run_tool(
 task_create_tool = function_tool(
     _task_create_tool,
     name_override="TaskCreate",
-    description_override="创建一个持久化任务节点。",
+    description_override="创建持久化任务；可选 assigned_agent/assigned_role 将任务路由给指定 teammate 或角色。",
 )
 task_update_tool = function_tool(
     _task_update_tool,

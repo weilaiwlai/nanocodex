@@ -4,6 +4,8 @@
 
 nanocodex 是一个面向**本地代码仓库**的智能编程助手，基于 OpenAI Agents SDK 构建。与云端 Code Agent 不同，nanocodex 深度整合本地环境，具备 workspace 级长期记忆和精细化的上下文治理能力，让 AI 能够真正理解你的代码库，成为你日常开发中的可靠搭档。
 
+支持保存可复用的多 Agent 工作流：步骤按角色分配，依赖完成后自动解锁，并把上游结果传递给下一位 Agent。用法和限制见[运行时补强说明](docs/runtime_upgrade.md#多-agent-工作流)。
+
 ## 核心亮点
 
 ### workspace 级长期记忆
@@ -191,6 +193,12 @@ TaskList
 # 更新任务状态
 TaskUpdate --task_id 1 --status in_progress
 ```
+
+#### 自动多 Agent 工作流
+
+使用 `WorkflowDefine` 保存步骤 DAG，再调用 `WorkflowStart` 启动。工作流会自动创建缺失的角色 Agent；上一步完成后依赖自动解锁，指定角色的 teammate 会认领下一步并收到上游结果。用 `WorkflowStatus` 查看步骤状态。完整字段和限制见[运行时补强说明](docs/runtime_upgrade.md#多-agent-工作流)。
+
+步骤可以用 `role` 路由到某个角色，或用 `agent` 固定到某位 teammate；`depends_on` 控制执行顺序，`input_from` 选择传给本步骤的上游结果。
 
 ## 技术架构
 

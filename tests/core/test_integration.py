@@ -13,7 +13,7 @@ from src.runtime.session import build_cli_session_runtime
 from src.runtime.runner import run_events
 from src.context.budget import build_model_input_filter
 from src.context.compaction import compact_session_history, HistorySummary
-from src.tasks.agent_team import AgentTeamRuntime, TeammateWorker
+from src.tasks.agent_team import AgentTeamRuntime, TeammateWorker, _build_task_input
 from src.tasks.task_store import create_task
 import queue
 
@@ -113,3 +113,20 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(callable(observed['run_config'].call_model_input_filter))
         self.assertIs(context.permission_broker, self.runtime.context.permission_broker)
         self.assertIs(context.command_manager, self.runtime.context.command_manager)
+
+    async def test_workflow_task_input_includes_upstream_result_and_artifact(self):
+        result = _build_task_input({
+            'id': 7,
+            'title': 'Verify implementation',
+            'summary': 'Run focused checks',
+            'prompt': 'Check the change.',
+            'dependency_results': [{
+                'task_id': 6,
+                'step_id': 'implement',
+                'status': 'completed',
+                'result_summary': 'Updated checkout.py and added a regression test.',
+                'result_artifact': 'checkout.py',
+            }],
+        })
+        self.assertIn('Updated checkout.py and added a regression test.', result['content'])
+        self.assertIn('Artifact: checkout.py', result['content'])

@@ -20,7 +20,12 @@ from types import SimpleNamespace
 from src.runtime.session import ToolRuntimeContext
 from src.runtime.tracing import build_trace_logger
 from src.runtime.persistence import write_json_atomic
-from src.tasks.task_graph import claim_task as claim_persistent_task, renew_task_lease, update_task
+from src.tasks.task_graph import (
+    claim_task as claim_persistent_task,
+    fail_task_attempt,
+    renew_task_lease,
+    update_task,
+)
 from src.tasks.task_store import get_task
 from src.tasks.worktrees import ensure_task_worktree
 from src.tools.common import ToolFailure
@@ -135,6 +140,21 @@ def _build_task_input(task: dict[str, object]) -> dict[str, str]:
     prompt = str(task.get("prompt") or "").strip()
     if prompt:
         parts.extend(["", prompt])
+    dependency_results = task.get("dependency_results")
+    if isinstance(dependency_results, list) and dependency_results:
+        parts.extend(["", "Upstream step results (use these as the input to this step):"])
+        for item in dependency_results:
+            if not isinstance(item, dict):
+                continue
+            parts.append(f"- Step {item.get('step_id') or item.get('task_id')} (task_{item.get('task_id')}):")
+            summary = str(item.get("result_summary") or "").strip()
+            if summary:
+                parts.append(summary[:24_000])
+            artifact = str(item.get("result_artifact") or "").strip()
+            if artifact:
+                parts.append(f"Artifact: {artifact}")
+            if item.get("status") != "completed":
+                parts.append(f"Upstream status: {item.get('status')}")
     return {
         "role": "user",
         "content": "\n".join(parts).strip(),
@@ -534,6 +554,8 @@ class AgentTeamRuntime:
             owner_agent_id=worker.agent_id,
             owner=f"teammate:{worker.name}",
             lease_seconds=TEAM_TASK_LEASE_SECONDS,
+            agent_name=worker.name,
+            agent_role=worker.role,
         )
         if claimed_task is None:
             worker.context.active_task_id = None
@@ -541,6 +563,17 @@ class AgentTeamRuntime:
             return None
         worker.context.active_task_id = int(claimed_task["id"])
         worker.context.active_lease_token = str(claimed_task["lease_token"])
+        dependency_results = []
+        for dependency_id in claimed_task.get("input_from", []):
+            dependency = get_task(self.base_context.tasks_dir, int(dependency_id))
+            dependency_results.append({
+                "task_id": dependency["id"],
+                "step_id": dependency.get("workflow_step_id"),
+                "status": dependency["status"],
+                "result_summary": dependency.get("result_summary"),
+                "result_artifact": dependency.get("result_artifact"),
+            })
+        claimed_task["dependency_results"] = dependency_results
         worker.lease_heartbeat = LeaseHeartbeat(
             tasks_dir=self.base_context.tasks_dir, task=claimed_task,
             owner_agent_id=worker.agent_id, lease_seconds=TEAM_TASK_LEASE_SECONDS,
@@ -585,18 +618,36 @@ class AgentTeamRuntime:
         *,
         task: dict[str, object],
     ) -> dict[str, object]:
-        # phase 4 只做最小 worktree 绑定：
-        # 需要隔离的任务切到 task 专属 worktree，否则回到 session 的 workspace_root。
+        # 普通 worktree 任务使用独立目录；工作流步骤绑定同一个运行目录，
+        # 让后续 Agent 能看到上一步写入的文件。
         if task.get("require_worktree"):
-            task = ensure_task_worktree(
-                runtime_context=worker.context,
-                task_id=int(task["id"]),
-            )
-            worktree_path = Path(str(task["worktree_path"]))
+            workflow_run_id = task.get("workflow_run_id")
+            if workflow_run_id:
+                from src.tasks.workflow import get_workflow_run
+
+                workflow = get_workflow_run(
+                    tasks_dir=self.base_context.tasks_dir,
+                    run_id=str(workflow_run_id),
+                )["run"]
+                if not workflow.get("worktree_path"):
+                    raise ToolFailure(
+                        code="INVALID_STATE",
+                        message=f"工作流 {workflow_run_id} 尚未绑定共享 worktree。",
+                        text="工作流共享 worktree 尚未准备好，任务无法执行。",
+                    )
+                worktree_name = workflow.get("worktree_name")
+                worktree_path = Path(str(workflow["worktree_path"]))
+            else:
+                task = ensure_task_worktree(
+                    runtime_context=worker.context,
+                    task_id=int(task["id"]),
+                )
+                worktree_name = task["worktree_name"]
+                worktree_path = Path(str(task["worktree_path"]))
             worker.context.set_execution_root(worktree_path)
             self._update_member(
                 worker.name,
-                current_worktree=str(task["worktree_name"]),
+                current_worktree=str(worktree_name),
             )
             self._append_transcript_event(
                 worker,
@@ -604,7 +655,7 @@ class AgentTeamRuntime:
                     event_type="worktree_bound",
                     payload={
                         "task_id": task["id"],
-                        "worktree_name": task["worktree_name"],
+                        "worktree_name": worktree_name,
                     },
                 ),
             )
@@ -766,19 +817,30 @@ class AgentTeamRuntime:
                         duration_ms=run_duration_ms,
                     ),
                 )
+                failed_task = None
                 if worker.context.active_task_id is not None:
                     try:
-                        update_task(tasks_dir=self.base_context.tasks_dir,
-                                    task_id=worker.context.active_task_id, status="failed",
-                                    owner=f"teammate:{worker.name}", error=str(exc),
-                                    expected_owner_agent_id=worker.agent_id,
-                                    expected_lease_token=worker.context.active_lease_token)
+                        failed_task = fail_task_attempt(
+                            tasks_dir=self.base_context.tasks_dir,
+                            task_id=worker.context.active_task_id,
+                            error=str(exc),
+                            expected_owner_agent_id=worker.agent_id,
+                            expected_lease_token=worker.context.active_lease_token,
+                        )
                     except TaskConflict:
                         pass  # A new owner has already taken over; discard this worker's result.
                     if worker.lease_heartbeat is not None:
                         worker.lease_heartbeat.__exit__()
                         worker.lease_heartbeat = None
-                    self._update_member(worker.name, current_task_id=None)
+                    self._update_member(
+                        worker.name,
+                        status="idle" if failed_task is not None else "failed",
+                        current_task_id=None,
+                    )
+                    if failed_task is not None:
+                        worker.context.active_task_id = None
+                        worker.context.active_lease_token = None
+                        continue
                 self._update_member(worker.name, status="failed")
                 return
 

@@ -6,7 +6,7 @@
 2. **可控长命令**：实时 stdout/stderr、进程 ID、增量游标、持久日志、有限超时，以及终止进程树。前台默认 120 秒，上限 600 秒；后台使用相同限制。内存保留每个输出流最后 65,536 个字符；日志上限约 32 MiB，发生截断会标记。最多同时运行 8 条命令。
 3. **任务一致性**：SQLite WAL 事务用于任务创建、认领、依赖更新和结果写回；自动迁移旧 `task_*.json`，保留原文件。持续心跳、唯一租约标识、任务版本检查阻止重复认领和过期结果覆盖；依赖循环会回滚。启动恢复只标记中断的后台命令，不破坏普通任务租约。
 4. **上下文治理**：主代理与队友复用规则、记忆、历史构建和模型调用前预算检查。预算包含指令、工具 schema、历史、当前输入和输出预留；大工具输出归档并压缩，旧历史可生成摘要，当前用户请求保持原样。无法满足预算时明确报错。历史替换使用单个 SQLite 事务和版本检查，兼容旧 SDK 会话数据库。
-5. **回归与评测**：`tests/core` 覆盖权限、并发、租约、历史、取消、工具接入和 SDK 适配层；`evals/coding_tasks.json` 提供 3 个编码任务，`scripts/evaluate.py` 支持重复执行和独立验收，输出 JSON 报告及提交文件。
+5. **回归与评测**：`tests/core` 覆盖权限、并发、租约、历史、取消、工具接入和 SDK 适配层；`evals/coding_tasks.json` 提供 8 个独立编码任务，`scripts/evaluate.py` 支持重复执行和独立验收，输出 JSON 报告及提交文件。
 
 ## 权限和取消
 
@@ -33,6 +33,49 @@ TUI 与 CLI 使用 JSONL：
 ```
 
 Python 入口为 `--json-events --control-stdin`；事件含 `command_started`、`command_output`、`command_finished`、`permission_requested`、`permission_resolved`、`context_compacted`。stdin 关闭会取消运行。TUI 优先使用 `NANOCODEX_TUI_PYTHON`，同时兼容旧的 `NANOCODOX_TUI_PYTHON`。
+
+## 多 Agent 工作流
+
+`WorkflowDefine` 保存一个可复用的 DAG 定义，`WorkflowStart` 启动新运行，`WorkflowStatus` 查看每个步骤和结果，`WorkflowList` 列出定义。启动时会为缺少的角色创建持久 teammate，之后队员自动认领已解锁任务；调度与步骤交接由任务运行时完成，不需要主 Agent逐步派发。
+
+工作流 JSON 的结构如下：
+
+```json
+{
+  "name": "implement-test-review",
+  "steps": [
+    {
+      "step_id": "implement",
+      "title": "Implement the change",
+      "prompt": "Implement the requested change and summarize modified files.",
+      "role": "coder",
+      "require_worktree": true,
+      "max_retries": 1
+    },
+    {
+      "step_id": "test",
+      "title": "Run focused tests",
+      "prompt": "Run tests for the change and report failures.",
+      "role": "tester",
+      "depends_on": ["implement"]
+    },
+    {
+      "step_id": "review",
+      "title": "Review the result",
+      "prompt": "Review the implementation and test result.",
+      "role": "reviewer",
+      "depends_on": ["implement", "test"],
+      "input_from": ["implement", "test"]
+    }
+  ]
+}
+```
+
+传给 `WorkflowDefine.workflow_json` 后，用返回的 `workflow_id` 调用 `WorkflowStart`。步骤可用 `role` 指定角色，也可用 `agent` 指定固定 teammate 名称；若两者都提供，认领时必须同时匹配。未填写 `input_from` 时，默认把全部 `depends_on` 步骤的摘要和产物引用交给下一步。工作流最多 32 步、8 条 Agent 路由；`max_retries` 范围为 0–5，默认 0。重试耗尽后运行标记为失败，下游保持阻塞，结果可通过 `WorkflowStatus` 检查。
+
+若任一步设置 `require_worktree: true`，启动时会先从干净的主工作区创建一个共享分支和 worktree；所有步骤在该目录串行执行，保证后续步骤能读取前序文件改动。工作区有未提交改动时启动会失败，以免把当前改动排除在 worktree 外。运行成功后，`WorkflowCloseout` 支持 `keep`、`remove` 或 `merge`；`merge` 只会合并已完成且两边都干净的运行分支，且需要分支上已有提交。该工具不会替 Agent 自动提交文件。
+
+评测任务从 3 个扩展到 8 个，覆盖列表稳定去重、范围夹取、时长格式化、CSV 引号解析和一次性迭代器平均值。固定答案 Agent 只验证评测 harness 和验收器能够工作，不代表真实模型的代码能力。
 
 ## 上下文配置
 
@@ -76,4 +119,8 @@ python3 scripts/evaluate.py --agent-json '["/absolute/path/to/python","{project}
 
 本次云环境缺少项目 Python/Node 依赖，离线缓存不足；因此 SDK 适配测试使用替身，React/Ink 完整类型检查和真实模型评测尚未执行。环境禁止 bubblewrap 创建命名空间，真实 OS 沙箱测试按原因跳过；程序保留失败即拒绝执行的行为。macOS 配置尚未在 macOS 实机验证。
 
-已运行的核心测试、TUI 纯逻辑测试和固定答案评测用于检查实现及评测流程。3 个小任务仅用于建立可重复基线，不能据此判断与官方 Codex 的整体能力差距。
+GitHub Actions 在 Ubuntu 和 macOS 上运行核心测试、Python 编译检查及 TUI 离线测试；Linux job 安装 bubblewrap，macOS job 覆盖 `sandbox-exec` 集成测试。受 runner 内核或系统策略限制时，OS 沙箱集成测试会按明确原因跳过。
+
+本轮增加的工作流测试和 8 项评测样例尚未在当前环境运行：仓库要求先进入 `conda xcode`，但该环境不可用。已运行的检查只有评测 JSON 结构校验和 TUI 离线测试（7 项通过）；推送后应以 Ubuntu/macOS CI 结果作为 Python 与沙箱检查依据。
+
+已运行的核心测试、TUI 纯逻辑测试和固定答案评测用于检查实现及评测流程。8 个小任务用于建立可重复基线，不能据此判断与官方 Codex 的整体能力差距。

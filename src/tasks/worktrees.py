@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from src.runtime.permissions import PermissionDenied
 from src.tasks.task_store import task_transaction
@@ -25,6 +26,15 @@ def _task_worktree_path(runtime_context: ToolRuntimeContext, task_id: int) -> Pa
     return _worktrees_dir(runtime_context) / f"task_{task_id}"
 
 
+def _workflow_branch_name(run_id: str) -> str:
+    return f"workflow/{run_id.removeprefix('run-')[:16]}"
+
+
+def _workflow_worktree_path(runtime_context: ToolRuntimeContext, run_id: str) -> Path:
+    suffix = run_id.removeprefix("run-")[:16]
+    return _worktrees_dir(runtime_context) / f"workflow_{suffix}"
+
+
 def _run_git_command(*, args: list[str], cwd: Path, runtime_context: ToolRuntimeContext):
     policy = runtime_context.execution_policy()
     try:
@@ -40,6 +50,10 @@ def _run_git_command(*, args: list[str], cwd: Path, runtime_context: ToolRuntime
     if result["status"] != "completed":
         raise ToolFailure(code="EXECUTION_ERROR", message=result["stderr"] or result["status"],
                           text="git 执行失败，请检查权限和仓库状态。")
+    if result["exit_code"] != 0:
+        detail = result["stderr"].strip() or result["stdout"].strip() or f"git exited with {result['exit_code']}"
+        raise ToolFailure(code="EXECUTION_ERROR", message=detail,
+                          text=f"git 命令失败：{detail}")
     return SimpleNamespace(returncode=result["exit_code"], stdout=result["stdout"], stderr=result["stderr"])
 
 
@@ -84,6 +98,123 @@ def ensure_task_worktree(
     task["worktree_path"] = str(resolved_worktree_path)
     task["worktree_branch"] = branch_name
     return _save_worktree_fields(runtime_context, task)
+
+
+def ensure_workflow_run_worktree(
+    *,
+    runtime_context: ToolRuntimeContext,
+    run_id: str,
+) -> dict[str, Any]:
+    """Create one branch/worktree shared by all steps in a workflow run."""
+    with task_transaction(runtime_context.tasks_dir) as store:
+        run = store.get_workflow_run(run_id)
+    if not run.get("require_worktree"):
+        return run
+    if run.get("worktree_path") and Path(str(run["worktree_path"])).exists():
+        return run
+
+    root = runtime_context.workspace_root
+    status = _run_git_command(
+        args=["git", "status", "--porcelain"],
+        cwd=root,
+        runtime_context=runtime_context,
+    )
+    if status.stdout.strip():
+        raise ToolFailure(
+            code="INVALID_STATE",
+            message="工作区有未提交改动，无法从 HEAD 创建共享工作流 worktree。",
+            text="工作区存在未提交改动。请先提交或收起这些改动，再启动需要 worktree 的工作流。",
+        )
+
+    worktree_path = _workflow_worktree_path(runtime_context, run_id)
+    branch_name = _workflow_branch_name(run_id)
+    try:
+        runtime_context.execution_policy().authorize_path(worktree_path.parent, write=True)
+    except PermissionDenied as exc:
+        raise ToolFailure(
+            code="ACCESS_DENIED",
+            message=str(exc),
+            text=f"先批准写入工作流 worktree 目录 {worktree_path.parent} 和仓库 .git。",
+        ) from exc
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    _run_git_command(
+        args=["git", "worktree", "add", "-b", branch_name, str(worktree_path), "HEAD"],
+        cwd=root,
+        runtime_context=runtime_context,
+    )
+
+    run["worktree_name"] = f"workflow-{run_id.removeprefix('run-')[:16]}"
+    run["worktree_path"] = str(worktree_path.resolve())
+    run["worktree_branch"] = branch_name
+    with task_transaction(runtime_context.tasks_dir) as store:
+        current = store.get_workflow_run(run_id)
+        if current.get("status") != "preparing":
+            raise ToolFailure(
+                code="INVALID_STATE",
+                message=f"工作流运行 {run_id} 已不在准备状态。",
+                text="工作流状态已变化，无法绑定共享 worktree。",
+            )
+        for key in ("worktree_name", "worktree_path", "worktree_branch"):
+            current[key] = run[key]
+        return store.put_workflow_run(current)
+
+
+def closeout_workflow_run(
+    *,
+    runtime_context: ToolRuntimeContext,
+    run_id: str,
+    action: str,
+) -> dict[str, Any]:
+    if action not in {"keep", "remove", "merge"}:
+        raise ToolFailure(code="INVALID_PARAM", message=f"非法 closeout 动作: {action}",
+                          text="action 只支持 keep、remove 或 merge。")
+    with task_transaction(runtime_context.tasks_dir) as store:
+        run = store.get_workflow_run(run_id)
+    worktree_path = str(run.get("worktree_path") or "").strip()
+    branch_name = str(run.get("worktree_branch") or "").strip()
+    if not worktree_path or not branch_name:
+        raise ToolFailure(code="NOT_FOUND", message=f"工作流 {run_id} 没有共享 worktree。",
+                          text=f"工作流 {run_id} 没有关联共享 worktree。")
+    if action == "merge":
+        if run.get("status") != "completed":
+            raise ToolFailure(code="INVALID_STATE", message="只能合并已完成的工作流。",
+                              text="工作流尚未成功完成，不能合并其 worktree。")
+        tree_status = _run_git_command(args=["git", "status", "--porcelain"], cwd=Path(worktree_path),
+                                       runtime_context=runtime_context)
+        if tree_status.stdout.strip():
+            raise ToolFailure(code="INVALID_STATE", message="工作流 worktree 有未提交改动。",
+                              text="工作流 worktree 有未提交改动。请先在该分支提交需要合并的改动，再重试。")
+        root_status = _run_git_command(args=["git", "status", "--porcelain"], cwd=runtime_context.workspace_root,
+                                       runtime_context=runtime_context)
+        if root_status.stdout.strip():
+            raise ToolFailure(code="INVALID_STATE", message="主工作区有未提交改动。",
+                              text="主工作区存在未提交改动。请先处理改动，再合并工作流分支。")
+        _run_git_command(
+            args=["git", "merge", "--no-ff", branch_name, "-m", f"merge {branch_name}"],
+            cwd=runtime_context.workspace_root,
+            runtime_context=runtime_context,
+        )
+    if action in {"remove", "merge"}:
+        if Path(worktree_path).exists():
+            _run_git_command(args=["git", "worktree", "remove", "--force", worktree_path],
+                             cwd=runtime_context.workspace_root, runtime_context=runtime_context)
+        try:
+            _run_git_command(args=["git", "branch", "-D" if action == "remove" else "-d", branch_name],
+                             cwd=runtime_context.workspace_root, runtime_context=runtime_context)
+        except ToolFailure:
+            pass
+        with task_transaction(runtime_context.tasks_dir) as store:
+            current = store.get_workflow_run(run_id)
+            current["worktree_name"] = None
+            current["worktree_path"] = None
+            current["worktree_branch"] = None
+            if action == "merge":
+                current["merged_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+            run = store.put_workflow_run(current)
+        if runtime_context.team_runtime is not None:
+            runtime_context.team_runtime.clear_worktree_binding(worktree_path=worktree_path)
+        return run
+    return run
 
 
 def list_worktrees(*, runtime_context: ToolRuntimeContext) -> list[dict[str, Any]]:

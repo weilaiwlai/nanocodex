@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -97,6 +98,18 @@ class ExecutionTests(unittest.TestCase):
         probe = subprocess.run([binary, '--unshare-all', '--ro-bind', '/', '/', '--', '/bin/true'], capture_output=True, timeout=5)
         if probe.returncode:
             self.skipTest('kernel blocks bubblewrap namespace setup')
+        (self.root / '.env').write_text('private-value')
+        session = self.manager.start('cat .env; touch result', cwd=self.root,
+                                     policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')
+        result = self.manager.wait(session.id)
+        self.assertNotIn('private-value', result['stdout'])
+        self.assertTrue((self.root / 'result').exists())
+
+    def test_macos_sandbox_integration(self):
+        if sys.platform != 'darwin':
+            self.skipTest('macOS only')
+        if not shutil.which('sandbox-exec'):
+            self.skipTest('sandbox-exec missing')
         (self.root / '.env').write_text('private-value')
         session = self.manager.start('cat .env; touch result', cwd=self.root,
                                      policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')

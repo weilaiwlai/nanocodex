@@ -22,7 +22,8 @@ class EvaluationTests(unittest.TestCase):
 
     def test_repeated_known_answers_and_report(self):
         report = self.run_eval([sys.executable, '{project}/evals/smoke_agent.py'], repeat=2)
-        self.assertEqual(6, report['passed'])
+        task_count = len(json.loads((ROOT / 'evals' / 'coding_tasks.json').read_text(encoding='utf-8')))
+        self.assertEqual(task_count * 2, report['passed'])
         self.assertEqual(1, report['completion_rate'])
         self.assertIsNone(report['results'][0]['tokens'])
         self.assertIsNone(report['results'][0]['cost_usd'])
@@ -31,7 +32,7 @@ class EvaluationTests(unittest.TestCase):
     def test_unmodified_fixture_fails(self):
         report = self.run_eval([sys.executable, '-c', 'pass'])
         self.assertEqual(0, report['passed'])
-        self.assertEqual(3, report['total'])
+        self.assertEqual(len(json.loads((ROOT / 'evals' / 'coding_tasks.json').read_text(encoding='utf-8'))), report['total'])
 
     def test_timeout_and_usage_accounting(self):
         report = self.run_eval([sys.executable, '-c', 'import time; time.sleep(3)'], timeout=0.05)
