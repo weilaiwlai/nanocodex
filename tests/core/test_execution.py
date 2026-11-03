@@ -111,10 +111,15 @@ class ExecutionTests(unittest.TestCase):
         if not shutil.which('sandbox-exec'):
             self.skipTest('sandbox-exec missing')
         (self.root / '.env').write_text('private-value')
-        session = self.manager.start('cat .env; touch result', cwd=self.root,
+        read_session = self.manager.start('cat .env', cwd=self.root,
                                      policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')
-        result = self.manager.wait(session.id)
-        self.assertNotIn('private-value', result['stdout'])
+        read_result = self.manager.wait(read_session.id)
+        self.assertNotIn('private-value', read_result['stdout'])
+
+        write_session = self.manager.start('touch result', cwd=self.root,
+                                           policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')
+        write_result = self.manager.wait(write_session.id)
+        self.assertEqual('completed', write_result['status'], write_result)
         self.assertTrue((self.root / 'result').exists())
 
 

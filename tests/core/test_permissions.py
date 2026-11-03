@@ -75,8 +75,8 @@ class PermissionTests(unittest.TestCase):
             args = self.policy.command('true', self.root, self.root / 'scratch')
         self.assertIn('--unshare-all', args)
         self.assertNotIn('--share-net', args)
-        self.assertIn(str(nested / '.env.local'), args)
-        self.assertIn(str(self.root / '.git'), args)
+        self.assertIn(str((nested / '.env.local').resolve()), args)
+        self.assertIn(str((self.root / '.git').resolve()), args)
 
     def test_control_does_not_approve_string_false(self):
         class Context:

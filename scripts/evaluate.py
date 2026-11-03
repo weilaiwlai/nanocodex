@@ -75,6 +75,9 @@ def evaluate(*, tasks_path, agent_argv, output_dir, timeout=120, repeat=1, input
             with tempfile.TemporaryDirectory(prefix='nanocodex-eval-') as temporary:
                 workspace = Path(temporary) / 'workspace'
                 workspace.mkdir()
+                # macOS exposes temporary directories through symlinked /var paths;
+                # compare fixture destinations against the same canonical root.
+                workspace = workspace.resolve()
                 for name, text in task['files'].items():
                     destination = (workspace / name).resolve()
                     if workspace not in destination.parents:

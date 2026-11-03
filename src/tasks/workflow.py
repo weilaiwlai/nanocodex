@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from src.tasks.task_store import TaskConflict, task_transaction
+from src.tasks.task_store import TaskConflict, get_task, task_transaction
 
 MAX_WORKFLOW_STEPS = 32
 MAX_RETRIES = 5
