@@ -19,6 +19,34 @@ class SandboxUnavailable(PermissionDenied):
     pass
 
 
+_MACOS_BOOTSTRAP_POLICY = '''
+(version 1)
+(deny default)
+(allow process*)
+(allow signal (target same-sandbox))
+(allow sysctl-read)
+; libSystem and dyld need these during process startup.
+(allow system-mac-syscall (mac-policy-name "vnguard"))
+(allow system-mac-syscall
+  (require-all (mac-policy-name "Sandbox") (mac-syscall-number 67)))
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.secinitd"))
+(allow file-read-metadata file-test-existence
+  (literal "/") (literal "/dev")
+  (literal "/etc") (literal "/tmp") (literal "/var")
+  (literal "/dev/stdin") (literal "/dev/stdout") (literal "/dev/stderr"))
+(allow file-read* file-test-existence file-write-data
+  (literal "/dev/null") (literal "/dev/zero"))
+(allow file-read* file-test-existence
+  (literal "/dev/random") (literal "/dev/urandom"))
+(allow file-read-data file-test-existence file-write-data (subpath "/dev/fd"))
+(allow file-read* file-write* (literal "/dev/tty"))
+'''
+
+
 def _within(path: Path, roots) -> bool:
     return any(path == root or root in path.parents for root in roots)
 
@@ -195,10 +223,17 @@ class ExecutionPolicy:
             if not binary:
                 raise SandboxUnavailable('sandbox-exec 不可用。')
             quote = lambda p: json.dumps(str(p))
-            profile = '(version 1)(deny default)(allow process*)(allow sysctl-read)'
-            for root in [*read_roots, *write_roots]:
-                profile += f'(allow file-read* (subpath {quote(root)}))'
+            profile = _MACOS_BOOTSTRAP_POLICY
+            readable_roots = list(dict.fromkeys(root.resolve() for root in [*read_roots, *write_roots]))
+            ancestors = sorted({parent for root in readable_roots for parent in root.parents})
+            for parent in ancestors:
+                profile += f'(allow file-read-metadata file-test-existence (literal {quote(parent)}))'
+            for root in readable_roots:
+                kind = 'subpath' if root.is_dir() else 'literal'
+                # file-read* does not include executable mappings on macOS.
+                profile += f'(allow file-read* file-test-existence file-map-executable ({kind} {quote(root)}))'
             for root in write_roots:
+                root = root.resolve()
                 profile += f'(allow file-write* (subpath {quote(root)}))'
             for path in protected:
                 kind = 'subpath' if path.is_dir() else 'literal'
@@ -206,10 +241,11 @@ class ExecutionPolicy:
                     if not _within(path.resolve(), writes):
                         profile += f'(deny file-write* ({kind} {quote(path)}))'
                 elif not _within(path.resolve(), reads):
-                    profile += f'(deny file-read* ({kind} {quote(path)}))(deny file-write* ({kind} {quote(path)}))'
+                    profile += f'(deny file-read* file-map-executable file-write* ({kind} {quote(path)}))'
             for root in self.state_roots:
+                root = root.resolve()
                 if root.is_dir() and not _within(root, writes):
-                    profile += f'(deny file-write* (require-all (subpath {quote(root)}) (require-not (subpath {quote(scratch)}))))'
+                    profile += f'(deny file-write* (require-all (subpath {quote(root)}) (require-not (subpath {quote(scratch.resolve())}))))'
             if network:
                 profile += '(allow network*)'
             return [binary, '-p', profile, '/bin/bash', '--noprofile', '--norc', '-c', command]

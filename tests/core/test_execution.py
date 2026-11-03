@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -110,17 +111,37 @@ class ExecutionTests(unittest.TestCase):
             self.skipTest('macOS only')
         if not shutil.which('sandbox-exec'):
             self.skipTest('sandbox-exec missing')
-        (self.root / '.env').write_text('private-value')
-        read_session = self.manager.start('cat .env', cwd=self.root,
-                                     policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')
-        read_result = self.manager.wait(read_session.id)
-        self.assertNotIn('private-value', read_result['stdout'])
+        workspace = self.root / 'workspace'
+        workspace.mkdir()
+        (workspace / '.env').write_text('private-value')
+        (workspace / '.git').mkdir()
+        (workspace / '.git' / 'config').write_text('original-config')
+        outside = self.root / 'outside.txt'
+        outside.write_text('outside-private-value')
+        policy = ExecutionPolicy(workspace, PermissionBroker())
 
-        write_session = self.manager.start('touch result', cwd=self.root,
-                                           policy=ExecutionPolicy(self.root, PermissionBroker()), output_dir=self.root / 'logs')
-        write_result = self.manager.wait(write_session.id)
-        self.assertEqual('completed', write_result['status'], write_result)
-        self.assertTrue((self.root / 'result').exists())
+        def run(command):
+            session = self.manager.start(command, cwd=workspace, policy=policy,
+                                         output_dir=self.root / 'logs')
+            return self.manager.wait(session.id)
+
+        # Prove that the shell and an external executable start successfully
+        # before interpreting a failed read as a sandbox denial.
+        result = run('touch result && printf sandbox-ready')
+        self.assertEqual('completed', result['status'], result)
+        self.assertEqual('sandbox-ready', result['stdout'])
+        self.assertTrue((workspace / 'result').exists())
+        for command, secret in [('cat .env', 'private-value'),
+                                (f'cat {shlex.quote(str(outside))}', 'outside-private-value')]:
+            with self.subTest(command=command):
+                denied = run(command)
+                self.assertEqual('failed', denied['status'], denied)
+                self.assertNotIn(secret, denied['stdout'])
+                self.assertTrue('Operation not permitted' in denied['stderr'] or
+                                'Permission denied' in denied['stderr'], denied)
+        denied = run('printf changed > .git/config')
+        self.assertEqual('failed', denied['status'], denied)
+        self.assertEqual('original-config', (workspace / '.git' / 'config').read_text())
 
 
 class StreamingTests(unittest.IsolatedAsyncioTestCase):
